@@ -9,7 +9,8 @@
 use crate::ast;
 use crate::compiled::FilterQuery;
 use crate::compiled::{
-    Comparable, Comparison, Function, LogicalExpr, Query, Segment, Selector, ValueArg,
+    Comparable, Comparison, ExistenceTest, Function, LogicalExpr, Query, Segment, Selector,
+    ValueArg,
 };
 use crate::node::{LocatedNode, NodeList};
 use crate::normalized_path::NormalizedPath;
@@ -66,6 +67,59 @@ pub fn evaluate_values<'a>(query: &Query, root: &'a Value) -> Vec<&'a Value> {
         .into_iter()
         .map(|((), value)| value)
         .collect()
+}
+
+// ---- Singular fast path ----------------------------------------------------------
+//
+// A query whose every segment is a single child name/index step selects at most one
+// node, so it needs neither a worklist nor any per-segment `Vec`: a single `&Value` is
+// threaded down the document. `JsonPath` precomputes this form (see
+// `compiled::Query::singular`) and dispatches here. Kept as standalone functions —
+// rather than a branch inside [`evaluate_values`] — so the general worklist path's
+// codegen (inlining of [`walk`], in-place `collect`) is left exactly as it was.
+
+/// Singular fast path for [`JsonPath::query`](crate::JsonPath::query): resolves the
+/// at-most-one selected node, building its normalized path as it descends.
+pub fn evaluate_singular<'a>(query: &ast::SingularQuery, root: &'a Value) -> NodeList<'a> {
+    NodeList::new(
+        eval_singular_located(query, root)
+            .map(|(path, value)| LocatedNode::new(path, value))
+            .into_iter()
+            .collect(),
+    )
+}
+
+/// Singular fast path for [`JsonPath::query_values`](crate::JsonPath::query_values):
+/// resolves the at-most-one selected value with no path construction.
+pub fn evaluate_singular_values<'a>(query: &ast::SingularQuery, root: &'a Value) -> Vec<&'a Value> {
+    eval_singular(query, root, root).into_iter().collect()
+}
+
+/// Resolves a top-level singular query (rooted at `$`) to its at-most-one node,
+/// building the normalized path of the result. The value-only counterpart is the
+/// existing [`eval_singular`].
+fn eval_singular_located<'a>(
+    query: &ast::SingularQuery,
+    root: &'a Value,
+) -> Option<(NormalizedPath, &'a Value)> {
+    let mut value = root;
+    let mut path = NormalizedPath::root();
+    for segment in &query.segments {
+        match segment {
+            ast::SingularSegment::Name(name) => {
+                value = value.as_object()?.get(name)?;
+                path = path.child_name(name);
+            }
+            ast::SingularSegment::Index(index) => {
+                let elements = value.as_array()?;
+                let resolved = normalize(index.get(), elements.len())?;
+                let (resolved, element) = element_at(elements, resolved)?;
+                value = element;
+                path = path.child_index(resolved);
+            }
+        }
+    }
+    Some((path, value))
 }
 
 /// Threads `segments` from `(start, start_value)`, carrying `root` for absolute filter
@@ -352,7 +406,10 @@ fn eval_logical<'a>(expr: &LogicalExpr, current: &'a Value, root: &'a Value) -> 
         }
         LogicalExpr::Not(inner) => !eval_logical(inner, current, root),
         LogicalExpr::Comparison(comparison) => eval_comparison(comparison, current, root),
-        LogicalExpr::Existence(query) => !eval_filter_query(query, current, root).is_empty(),
+        LogicalExpr::Existence(test) => match test {
+            ExistenceTest::Singular(query) => eval_singular(query, current, root).is_some(),
+            ExistenceTest::General(query) => !eval_filter_query(query, current, root).is_empty(),
+        },
         LogicalExpr::Test(function) => eval_logical_function(function, current, root),
     }
 }
@@ -371,12 +428,12 @@ enum Comparand<'a> {
 }
 
 fn eval_comparable<'a>(
-    comparable: &Comparable,
+    comparable: &'a Comparable,
     current: &'a Value,
     root: &'a Value,
 ) -> Comparand<'a> {
     match comparable {
-        Comparable::Literal(literal) => Comparand::Value(Cow::Owned(literal_to_value(literal))),
+        Comparable::Literal(value) => Comparand::Value(Cow::Borrowed(value.as_ref())),
         Comparable::Singular(query) => eval_singular(query, current, root)
             .map_or(Comparand::Nothing, |value| {
                 Comparand::Value(Cow::Borrowed(value))
@@ -410,19 +467,10 @@ fn index_into(value: &Value, index: i64) -> Option<&Value> {
     element_at(elements, resolved).map(|(_, element)| element)
 }
 
-fn literal_to_value(literal: &ast::Literal) -> Value {
-    match literal {
-        ast::Literal::Number(number) => Value::Number(number.clone()),
-        ast::Literal::String(string) => Value::String(string.clone()),
-        ast::Literal::Bool(boolean) => Value::Bool(*boolean),
-        ast::Literal::Null => Value::Null,
-    }
-}
-
 // ---- Function extensions ---------------------------------------------------------
 
 fn eval_value_function<'a>(
-    function: &Function,
+    function: &'a Function,
     current: &'a Value,
     root: &'a Value,
 ) -> Comparand<'a> {
@@ -439,9 +487,9 @@ fn eval_value_function<'a>(
     }
 }
 
-fn eval_value_arg<'a>(arg: &ValueArg, current: &'a Value, root: &'a Value) -> Comparand<'a> {
+fn eval_value_arg<'a>(arg: &'a ValueArg, current: &'a Value, root: &'a Value) -> Comparand<'a> {
     match arg {
-        ValueArg::Literal(literal) => Comparand::Value(Cow::Owned(literal_to_value(literal))),
+        ValueArg::Literal(value) => Comparand::Value(Cow::Borrowed(value.as_ref())),
         ValueArg::Singular(query) => eval_singular(query, current, root)
             .map_or(Comparand::Nothing, |value| {
                 Comparand::Value(Cow::Borrowed(value))

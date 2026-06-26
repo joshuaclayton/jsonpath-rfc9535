@@ -37,7 +37,10 @@ impl JsonPath {
     /// paired with its normalized path). Borrows from `root`; never fails.
     #[must_use]
     pub fn query<'a>(&self, root: &'a Value) -> NodeList<'a> {
-        crate::eval::evaluate(self.compiled(), root)
+        self.query.singular.as_ref().map_or_else(
+            || crate::eval::evaluate(self.compiled(), root),
+            |singular| crate::eval::evaluate_singular(singular, root),
+        )
     }
 
     /// Evaluates the query against `root`, returning just the selected values in order.
@@ -47,7 +50,10 @@ impl JsonPath {
     /// caller does not need paths.
     #[must_use]
     pub fn query_values<'a>(&self, root: &'a Value) -> Vec<&'a Value> {
-        crate::eval::evaluate_values(self.compiled(), root)
+        self.query.singular.as_ref().map_or_else(
+            || crate::eval::evaluate_values(self.compiled(), root),
+            |singular| crate::eval::evaluate_singular_values(singular, root),
+        )
     }
 
     /// Returns the compiled query IR (consumed by the evaluator).
@@ -116,6 +122,39 @@ mod tests {
             filtered.query_values(&doc),
             vec![&serde_json::json!(20), &serde_json::json!(30)],
             "filter keeps elements greater than 15"
+        );
+    }
+
+    #[test]
+    fn singular_fast_path_resolves_value_and_path() {
+        // A pure name/index chain takes the singular fast path; verify it agrees with the
+        // RFC on both the value and the normalized path, including negative-index
+        // normalization (`[-1]` → the resolved positive index in the path).
+        let doc = serde_json::json!({"a": {"b": [10, 20, 30]}});
+        let query = JsonPath::parse("$.a.b[-1]").expect("compiles");
+
+        assert_eq!(
+            query.query_values(&doc),
+            vec![&serde_json::json!(30)],
+            "negative index selects the last element"
+        );
+        let nodes = query.query(&doc);
+        assert_eq!(
+            nodes.values().collect::<Vec<_>>(),
+            vec![&serde_json::json!(30)],
+            "path API selects the same value"
+        );
+        assert_eq!(
+            nodes.paths().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["$['a']['b'][2]".to_owned()],
+            "the path records the resolved (positive) index"
+        );
+
+        // A singular query that matches nothing yields an empty nodelist (no panic).
+        let missing = JsonPath::parse("$.a.b[9]").expect("compiles");
+        assert!(
+            missing.query_values(&doc).is_empty(),
+            "out-of-range index selects nothing"
         );
     }
 

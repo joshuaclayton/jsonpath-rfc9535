@@ -19,11 +19,17 @@
 
 use crate::ast;
 use crate::error::Error;
+use serde_json::Value;
 
 /// A compiled query — the root of the IR (implicitly rooted at `$`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Query {
     pub segments: Vec<Segment>,
+    /// The singular form of this query, if every segment is a single child name or
+    /// index step (so it selects at most one node). Precomputed at compile time so the
+    /// evaluator can take a path-free, allocation-free fast path for the common
+    /// `$.a.b[0].c` shape instead of running the general worklist traversal.
+    pub singular: Option<ast::SingularQuery>,
 }
 
 /// A compiled segment.
@@ -51,9 +57,21 @@ pub enum LogicalExpr {
     Not(Box<Self>),
     Comparison(Comparison),
     /// A bare query used as an existence test.
-    Existence(FilterQuery),
+    Existence(ExistenceTest),
     /// A `LogicalType` function used as a test (`match`/`search`).
     Test(Function),
+}
+
+/// A compiled existence test (`?@.a.b`, `?@.items[*]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExistenceTest {
+    /// The sub-query is singular (only single name/index steps), so it selects at most
+    /// one node: presence is a path-free `eval_singular(...).is_some()` check with no
+    /// nodelist allocation — the common `?@.field` / `?@.a.b` case.
+    Singular(ast::SingularQuery),
+    /// A general sub-query that may select many nodes; presence is decided by evaluating
+    /// it and testing for non-emptiness.
+    General(FilterQuery),
 }
 
 /// A compiled comparison.
@@ -67,7 +85,11 @@ pub struct Comparison {
 /// A compiled comparable — guaranteed to denote at most one value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Comparable {
-    Literal(ast::Literal),
+    /// A literal, pre-converted to its `serde_json::Value` at compile time so the
+    /// evaluator borrows it instead of rebuilding (and heap-cloning) it per comparison.
+    /// Boxed to keep `Selector`/`Comparable` small (a `Value` is far larger than the
+    /// other variants).
+    Literal(Box<Value>),
     Singular(ast::SingularQuery),
     /// A `ValueType` function (`length`/`count`/`value`).
     Function(Function),
@@ -98,7 +120,9 @@ pub enum Function {
 /// An argument occupying a `ValueType` parameter slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueArg {
-    Literal(ast::Literal),
+    /// A literal, pre-converted to its `serde_json::Value` at compile time (see
+    /// [`Comparable::Literal`]).
+    Literal(Box<Value>),
     Singular(ast::SingularQuery),
     /// A nested `ValueType` function.
     Function(Box<Function>),
@@ -122,8 +146,30 @@ enum ResultType {
 /// way that violates the type system (e.g. a non-singular query in a `ValueType` slot,
 /// or a `LogicalType` result used as a comparable).
 pub fn lower(query: ast::Query) -> Result<Query, Error> {
-    Ok(Query {
-        segments: lower_segments(query.segments)?,
+    let segments = lower_segments(query.segments)?;
+    let singular = singular_form(&segments);
+    Ok(Query { segments, singular })
+}
+
+/// Returns the singular-query form of a top-level query if every segment is a single
+/// child name or index step, or `None` if it may select more than one node. Mirrors
+/// [`to_singular`] but works on the *compiled* top-level segments (which are always
+/// rooted at `$`).
+fn singular_form(segments: &[Segment]) -> Option<ast::SingularQuery> {
+    let mut steps = Vec::with_capacity(segments.len());
+    for segment in segments {
+        match segment {
+            Segment::Child(selectors) => match selectors.as_slice() {
+                [Selector::Name(name)] => steps.push(ast::SingularSegment::Name(name.clone())),
+                [Selector::Index(index)] => steps.push(ast::SingularSegment::Index(*index)),
+                _ => return None,
+            },
+            Segment::Descendant(_) => return None,
+        }
+    }
+    Some(ast::SingularQuery {
+        root: ast::QueryRoot::Root,
+        segments: steps,
     })
 }
 
@@ -174,7 +220,13 @@ fn lower_logical(expr: ast::LogicalExpr) -> Result<LogicalExpr, Error> {
             Ok(LogicalExpr::Comparison(lower_comparison(comparison)?))
         }
         ast::LogicalExpr::Existence(query) => {
-            Ok(LogicalExpr::Existence(lower_filter_query(query)?))
+            // A singular sub-query selects ≤1 node, so existence is an allocation-free
+            // presence check; only a genuinely multi-node query needs the worklist walk.
+            let test = match to_singular(&query) {
+                Some(singular) => ExistenceTest::Singular(singular),
+                None => ExistenceTest::General(lower_filter_query(query)?),
+            };
+            Ok(LogicalExpr::Existence(test))
         }
         ast::LogicalExpr::FunctionTest(function) => {
             let (function, result) = lower_function(function)?;
@@ -188,6 +240,18 @@ fn lower_logical(expr: ast::LogicalExpr) -> Result<LogicalExpr, Error> {
     }
 }
 
+/// Converts an AST literal to its `serde_json::Value` once, at compile time. The
+/// evaluator then borrows the stored value rather than rebuilding it (and heap-cloning
+/// any string) on every comparison.
+fn literal_to_value(literal: &ast::Literal) -> Value {
+    match literal {
+        ast::Literal::Number(number) => Value::Number(number.clone()),
+        ast::Literal::String(string) => Value::String(string.clone()),
+        ast::Literal::Bool(boolean) => Value::Bool(*boolean),
+        ast::Literal::Null => Value::Null,
+    }
+}
+
 fn lower_comparison(comparison: ast::Comparison) -> Result<Comparison, Error> {
     Ok(Comparison {
         left: lower_comparable(comparison.left)?,
@@ -198,7 +262,9 @@ fn lower_comparison(comparison: ast::Comparison) -> Result<Comparison, Error> {
 
 fn lower_comparable(comparable: ast::Comparable) -> Result<Comparable, Error> {
     match comparable {
-        ast::Comparable::Literal(literal) => Ok(Comparable::Literal(literal)),
+        ast::Comparable::Literal(literal) => {
+            Ok(Comparable::Literal(Box::new(literal_to_value(&literal))))
+        }
         ast::Comparable::SingularQuery(query) => Ok(Comparable::Singular(query)),
         ast::Comparable::Function(function) => {
             let (function, result) = lower_function(function)?;
@@ -273,7 +339,9 @@ fn take<const N: usize>(
 /// a nested `ValueType` function).
 fn value_arg(arg: ast::FunctionArg) -> Result<ValueArg, Error> {
     match arg {
-        ast::FunctionArg::Literal(literal) => Ok(ValueArg::Literal(literal)),
+        ast::FunctionArg::Literal(literal) => {
+            Ok(ValueArg::Literal(Box::new(literal_to_value(&literal))))
+        }
         ast::FunctionArg::Query(query) => to_singular(&query).map_or_else(
             || {
                 Err(Error::IllTyped {
