@@ -1,0 +1,6 @@
+/target
+# Criterion baseline store (machine-specific; see benches/BASELINE.md for the committed
+# snapshot). Kept here rather than target/ so baselines survive `cargo clean`.
+/.criterion
+# Per-user, machine-specific Claude Code settings.
+/.claude/settings.local.json

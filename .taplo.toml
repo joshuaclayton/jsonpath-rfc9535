@@ -1,0 +1,25 @@
+# Generated tomls (e.g. the `cargo publish` package under target/) must not be
+# checked; rule-level `exclude` only scopes formatting, so file discovery is excluded
+# here at the top level.
+exclude = ["target/**"]
+
+[[rule]]
+exclude = ["target/**"]
+include = ["**/*.toml"]
+
+[rule.formatting]
+reorder_arrays = false
+reorder_inline_tables = false
+reorder_keys = false
+
+[[rule]]
+include = ["**/Cargo.toml"]
+keys = [
+  "dependencies",
+  "dev-dependencies",
+  "build-dependencies",
+  "workspace.dependencies",
+]
+
+[rule.formatting]
+reorder_keys = true

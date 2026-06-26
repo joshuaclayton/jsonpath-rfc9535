@@ -1,0 +1,10 @@
+# The crate is held to a strict clippy profile (see `[lints.clippy]` in Cargo.toml).
+# The single sanctioned relaxation: `.expect("…")` is permitted inside test code
+# (`#[cfg(test)]` modules, `#[test]` fns, and doctests). Everything else --
+# `unwrap`, indexing, slicing, missing assert messages -- stays strict in tests too.
+allow-expect-in-tests = true
+
+# Domain proper nouns that appear in prose throughout the docs. Without this,
+# `doc_markdown` (pedantic) demands they be wrapped in backticks as if they were
+# code. The trailing `..` appends to clippy's built-in list rather than replacing it.
+doc-valid-idents = ["JSONPath", "I-JSON", "I-Regexp", ".."]

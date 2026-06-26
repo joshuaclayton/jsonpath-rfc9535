@@ -1,0 +1,84 @@
+[package]
+name = "jp-full"
+version = "0.1.0"
+edition = "2024"
+description = "A complete, RFC 9535 (JSONPath) compliant query engine for serde_json values."
+keywords = ["jsonpath", "rfc9535", "json", "query", "nom"]
+categories = ["parser-implementations", "data-structures"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+# Large benchmark fixtures and their generator are dev-only; keep them out of the
+# published .crate.
+exclude = ["/benches/data"]
+
+[dependencies]
+nom = "^8"
+regex = { version = "1.12.4", optional = true }
+serde_json = "1.0.150"
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = "deny"
+nursery = "deny"
+exhaustive_enums = "deny"
+exhaustive_structs = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+get_unwrap = "deny"
+expect_used = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+use_debug = "deny"
+dbg_macro = "deny"
+exit = "deny"
+map_err_ignore = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+wildcard_enum_match_arm = "deny"
+allow_attributes_without_reason = "deny"
+allow_attributes = "deny"
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
+partial_pub_fields = "deny"
+unseparated_literal_suffix = "deny"
+missing_assert_message = "deny"
+redundant_else = "deny"
+
+[features]
+default = ["regex"]
+# Enables the `match()` and `search()` function extensions, which require an
+# I-Regexp (RFC 9485) engine backed by the `regex` crate. Without this feature a
+# query that uses `match()`/`search()` fails to compile with a clear error.
+regex = ["dep:regex"]
+# Gates the cross-library comparison bench (`benches/comparison.rs`). Pulls in `regex`
+# so the `search()` case works even under `--no-default-features`. Not part of the
+# published API; enable only to run `cargo bench --features compare`.
+compare = ["regex"]
+
+[dev-dependencies]
+criterion = "0.8.2"
+jsonpath-rust = "1.0.4"
+jsonpath_lib = "0.3.0"
+proptest = "1.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+
+[[bench]]
+name = "queries"
+harness = false
+
+[[bench]]
+name = "comparison"
+harness = false
+required-features = ["compare"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
