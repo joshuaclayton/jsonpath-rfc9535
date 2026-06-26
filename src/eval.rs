@@ -31,16 +31,20 @@ trait Position: Clone {
 }
 
 impl Position for NormalizedPath {
+    #[inline]
     fn descend_name(&self, name: &str) -> Self {
         self.child_name(name)
     }
+    #[inline]
     fn descend_index(&self, index: usize) -> Self {
         self.child_index(index)
     }
 }
 
 impl Position for () {
+    #[inline]
     fn descend_name(&self, _name: &str) -> Self {}
+    #[inline]
     fn descend_index(&self, _index: usize) -> Self {}
 }
 
@@ -74,7 +78,10 @@ fn walk<'a, P: Position>(
 ) -> Vec<(P, &'a Value)> {
     let mut nodes: Vec<(P, &'a Value)> = vec![(start, start_value)];
     for segment in segments {
-        let mut next = Vec::new();
+        // Most segments select roughly one node per input node (every name/index/filter
+        // match), so pre-size to avoid the small-Vec realloc chain; wildcard/descendant
+        // grow further via their own `reserve`/pushes.
+        let mut next = Vec::with_capacity(nodes.len());
         apply_segment(segment, &nodes, root, &mut next);
         nodes = next;
     }
@@ -100,9 +107,41 @@ fn apply_segment<'a, P: Position>(
         }
         Segment::Descendant(selectors) => {
             for (path, value) in input {
-                descend(selectors, path, value, root, out);
+                // Specialize the common `$..name` shape to a tight recursion that
+                // skips the per-node selector-slice loop and enum dispatch of `descend`.
+                match selectors.as_slice() {
+                    [Selector::Name(name)] => descend_name(name, path, value, out),
+                    _ => descend(selectors, path, value, root, out),
+                }
             }
         }
+    }
+}
+
+/// Specialized `$..name` descendant: pushes every object member named `name`, reachable
+/// at any depth, in pre-order. Mirrors the general `descend` for a single name selector
+/// but without per-node dispatch.
+fn descend_name<'a, P: Position>(
+    name: &str,
+    path: &P,
+    value: &'a Value,
+    out: &mut Vec<(P, &'a Value)>,
+) {
+    match value {
+        Value::Object(members) => {
+            if let Some(member) = members.get(name) {
+                out.push((path.descend_name(name), member));
+            }
+            for (key, member) in members {
+                descend_name(name, &path.descend_name(key), member, out);
+            }
+        }
+        Value::Array(elements) => {
+            for (index, element) in elements.iter().enumerate() {
+                descend_name(name, &path.descend_index(index), element, out);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -134,6 +173,7 @@ fn descend<'a, P: Position>(
     }
 }
 
+#[inline]
 fn apply_selector<'a, P: Position>(
     selector: &Selector,
     path: &P,
@@ -150,6 +190,7 @@ fn apply_selector<'a, P: Position>(
     }
 }
 
+#[inline]
 fn apply_name<'a, P: Position>(
     name: &str,
     path: &P,
@@ -161,6 +202,7 @@ fn apply_name<'a, P: Position>(
     }
 }
 
+#[inline]
 fn apply_wildcard<'a, P: Position>(path: &P, value: &'a Value, out: &mut Vec<(P, &'a Value)>) {
     match value {
         Value::Array(elements) => {
@@ -179,6 +221,7 @@ fn apply_wildcard<'a, P: Position>(path: &P, value: &'a Value, out: &mut Vec<(P,
     }
 }
 
+#[inline]
 fn apply_index<'a, P: Position>(
     index: ast::JsonInt,
     path: &P,
@@ -255,6 +298,7 @@ fn element_at(elements: &[Value], index: i64) -> Option<(usize, &Value)> {
     elements.get(resolved).map(|element| (resolved, element))
 }
 
+#[inline]
 fn apply_filter<'a, P: Position>(
     expr: &LogicalExpr,
     path: &P,
