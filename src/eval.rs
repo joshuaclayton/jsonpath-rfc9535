@@ -74,58 +74,60 @@ fn walk<'a, P: Position>(
 ) -> Vec<(P, &'a Value)> {
     let mut nodes: Vec<(P, &'a Value)> = vec![(start, start_value)];
     for segment in segments {
-        nodes = apply_segment(segment, &nodes, root);
+        let mut next = Vec::new();
+        apply_segment(segment, &nodes, root, &mut next);
+        nodes = next;
     }
     nodes
 }
 
+/// Applies `segment` to every node in `input`, pushing selected nodes into `out`.
+/// Selectors push directly into `out` — no per-node or per-selector intermediate
+/// vector — and the descendant walk is fused with selection (see [`descend`]).
 fn apply_segment<'a, P: Position>(
     segment: &Segment,
     input: &[(P, &'a Value)],
     root: &'a Value,
-) -> Vec<(P, &'a Value)> {
-    let mut result = Vec::new();
+    out: &mut Vec<(P, &'a Value)>,
+) {
     match segment {
         Segment::Child(selectors) => {
             for (path, value) in input {
                 for selector in selectors {
-                    result.extend(apply_selector(selector, path, value, root));
+                    apply_selector(selector, path, value, root, out);
                 }
             }
         }
         Segment::Descendant(selectors) => {
             for (path, value) in input {
-                let mut visited = Vec::new();
-                collect_descendants(path, value, &mut visited);
-                for (descendant_path, descendant_value) in &visited {
-                    for selector in selectors {
-                        result.extend(apply_selector(
-                            selector,
-                            descendant_path,
-                            descendant_value,
-                            root,
-                        ));
-                    }
-                }
+                descend(selectors, path, value, root, out);
             }
         }
     }
-    result
 }
 
-/// Collects a node and all of its descendants in pre-order (a node before its
-/// descendants; array elements in order; object members in map order).
-fn collect_descendants<'a, P: Position>(path: &P, value: &'a Value, out: &mut Vec<(P, &'a Value)>) {
-    out.push((path.clone(), value));
+/// Applies `selectors` to `value` and every descendant in pre-order (a node before its
+/// descendants; array elements in order; object members in map order), pushing matches
+/// into `out`. Fused with the traversal, so the full descendant set is never collected.
+fn descend<'a, P: Position>(
+    selectors: &[Selector],
+    path: &P,
+    value: &'a Value,
+    root: &'a Value,
+    out: &mut Vec<(P, &'a Value)>,
+) {
+    for selector in selectors {
+        apply_selector(selector, path, value, root, out);
+    }
     match value {
         Value::Array(elements) => {
             for (index, element) in elements.iter().enumerate() {
-                collect_descendants(&path.descend_index(index), element, out);
+                descend(selectors, &path.descend_index(index), element, root, out);
             }
         }
         Value::Object(members) => {
             for (key, member) in members {
-                collect_descendants(&path.descend_name(key), member, out);
+                descend(selectors, &path.descend_name(key), member, root, out);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
@@ -137,35 +139,43 @@ fn apply_selector<'a, P: Position>(
     path: &P,
     value: &'a Value,
     root: &'a Value,
-) -> Vec<(P, &'a Value)> {
+    out: &mut Vec<(P, &'a Value)>,
+) {
     match selector {
-        Selector::Name(name) => apply_name(name, path, value).into_iter().collect(),
-        Selector::Wildcard => apply_wildcard(path, value),
-        Selector::Index(index) => apply_index(*index, path, value).into_iter().collect(),
-        Selector::Slice(slice) => apply_slice(slice, path, value),
-        Selector::Filter(expr) => apply_filter(expr, path, value, root),
+        Selector::Name(name) => apply_name(name, path, value, out),
+        Selector::Wildcard => apply_wildcard(path, value, out),
+        Selector::Index(index) => apply_index(*index, path, value, out),
+        Selector::Slice(slice) => apply_slice(slice, path, value, out),
+        Selector::Filter(expr) => apply_filter(expr, path, value, root, out),
     }
 }
 
-fn apply_name<'a, P: Position>(name: &str, path: &P, value: &'a Value) -> Option<(P, &'a Value)> {
-    value
-        .as_object()
-        .and_then(|members| members.get(name))
-        .map(|member| (path.descend_name(name), member))
+fn apply_name<'a, P: Position>(
+    name: &str,
+    path: &P,
+    value: &'a Value,
+    out: &mut Vec<(P, &'a Value)>,
+) {
+    if let Some(member) = value.as_object().and_then(|members| members.get(name)) {
+        out.push((path.descend_name(name), member));
+    }
 }
 
-fn apply_wildcard<'a, P: Position>(path: &P, value: &'a Value) -> Vec<(P, &'a Value)> {
+fn apply_wildcard<'a, P: Position>(path: &P, value: &'a Value, out: &mut Vec<(P, &'a Value)>) {
     match value {
-        Value::Array(elements) => elements
-            .iter()
-            .enumerate()
-            .map(|(index, element)| (path.descend_index(index), element))
-            .collect(),
-        Value::Object(members) => members
-            .iter()
-            .map(|(key, member)| (path.descend_name(key), member))
-            .collect(),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Vec::new(),
+        Value::Array(elements) => {
+            out.reserve(elements.len());
+            for (index, element) in elements.iter().enumerate() {
+                out.push((path.descend_index(index), element));
+            }
+        }
+        Value::Object(members) => {
+            out.reserve(members.len());
+            for (key, member) in members {
+                out.push((path.descend_name(key), member));
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -173,26 +183,31 @@ fn apply_index<'a, P: Position>(
     index: ast::JsonInt,
     path: &P,
     value: &'a Value,
-) -> Option<(P, &'a Value)> {
-    let elements = value.as_array()?;
-    let (resolved, element) = element_at(elements, normalize(index.get(), elements.len())?)?;
-    Some((path.descend_index(resolved), element))
+    out: &mut Vec<(P, &'a Value)>,
+) {
+    if let Some(elements) = value.as_array()
+        && let Some(position) = normalize(index.get(), elements.len())
+        && let Some((resolved, element)) = element_at(elements, position)
+    {
+        out.push((path.descend_index(resolved), element));
+    }
 }
 
 fn apply_slice<'a, P: Position>(
     slice: &ast::Slice,
     path: &P,
     value: &'a Value,
-) -> Vec<(P, &'a Value)> {
+    out: &mut Vec<(P, &'a Value)>,
+) {
     let Some(elements) = value.as_array() else {
-        return Vec::new();
+        return;
     };
     let Ok(len) = i64::try_from(elements.len()) else {
-        return Vec::new();
+        return;
     };
     let step = slice.step.map_or(1, ast::JsonInt::get);
     if step == 0 {
-        return Vec::new();
+        return;
     }
     let (start_default, end_default) = if step >= 0 {
         (0, len)
@@ -203,7 +218,6 @@ fn apply_slice<'a, P: Position>(
     let end = slice.end.map_or(end_default, ast::JsonInt::get);
     let (lower, upper) = bounds(start, end, step, len);
 
-    let mut out = Vec::new();
     let mut index = if step > 0 { lower } else { upper };
     while (step > 0 && index < upper) || (step < 0 && lower < index) {
         if let Some((resolved, element)) = element_at(elements, index) {
@@ -211,7 +225,6 @@ fn apply_slice<'a, P: Position>(
         }
         index = index.saturating_add(step);
     }
-    out
 }
 
 /// Normalizes a possibly-negative index against `len`, returning `None` if the array
@@ -247,20 +260,24 @@ fn apply_filter<'a, P: Position>(
     path: &P,
     value: &'a Value,
     root: &'a Value,
-) -> Vec<(P, &'a Value)> {
+    out: &mut Vec<(P, &'a Value)>,
+) {
     match value {
-        Value::Array(elements) => elements
-            .iter()
-            .enumerate()
-            .filter(|(_, element)| eval_logical(expr, element, root))
-            .map(|(index, element)| (path.descend_index(index), element))
-            .collect(),
-        Value::Object(members) => members
-            .iter()
-            .filter(|(_, member)| eval_logical(expr, member, root))
-            .map(|(key, member)| (path.descend_name(key), member))
-            .collect(),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Vec::new(),
+        Value::Array(elements) => {
+            for (index, element) in elements.iter().enumerate() {
+                if eval_logical(expr, element, root) {
+                    out.push((path.descend_index(index), element));
+                }
+            }
+        }
+        Value::Object(members) => {
+            for (key, member) in members {
+                if eval_logical(expr, member, root) {
+                    out.push((path.descend_name(key), member));
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
