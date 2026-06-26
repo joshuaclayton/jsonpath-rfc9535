@@ -34,15 +34,20 @@ struct Link<'a> {
 
 /// The canonical, unique location of a node within a JSON document.
 ///
-/// Construct the root with [`NormalizedPath::root`] and descend with
-/// [`child_name`](NormalizedPath::child_name) / [`child_index`](NormalizedPath::child_index);
-/// each returns a new path that shares its ancestors with the original. Render it
-/// with [`Display`](fmt::Display) (or [`ToString`]) to get the `$['a'][3]` form.
+/// You obtain a `NormalizedPath` from a query result — [`LocatedNode::path`] or
+/// [`NodeList::paths`] — and render it with [`Display`](fmt::Display) (or
+/// [`ToString`]) to get the canonical bracket form defined by [RFC 9535 §2.7], e.g.
+/// `$['a'][3]`. Two paths compare equal exactly when they identify the same node.
 ///
 /// The lifetime `'a` ties a path to the document it locates a node in: member-name
 /// steps borrow the document's map keys rather than copying them, so a path cannot
-/// outlive that document (neither can a [`NodeList`](crate::NodeList), which borrows
-/// the selected values themselves).
+/// outlive that document (neither can a [`NodeList`], which borrows the selected
+/// values themselves).
+///
+/// [`LocatedNode::path`]: crate::LocatedNode::path
+/// [`NodeList::paths`]: crate::NodeList::paths
+/// [`NodeList`]: crate::NodeList
+/// [RFC 9535 §2.7]: https://www.rfc-editor.org/rfc/rfc9535#section-2.7
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedPath<'a> {
     head: Option<Rc<Link<'a>>>,
@@ -50,20 +55,17 @@ pub struct NormalizedPath<'a> {
 
 impl<'a> NormalizedPath<'a> {
     /// The path of the document root, `$`.
-    #[must_use]
-    pub const fn root() -> Self {
+    pub(crate) const fn root() -> Self {
         Self { head: None }
     }
 
     /// Returns the path of the object member `name` reached from this path.
-    #[must_use]
-    pub fn child_name(&self, name: &'a str) -> Self {
+    pub(crate) fn child_name(&self, name: &'a str) -> Self {
         self.push(Step::Name(name))
     }
 
     /// Returns the path of the array element at `index` reached from this path.
-    #[must_use]
-    pub fn child_index(&self, index: usize) -> Self {
+    pub(crate) fn child_index(&self, index: usize) -> Self {
         self.push(Step::Index(index))
     }
 

@@ -51,8 +51,8 @@ pub enum Error {
         message: String,
     },
 
-    /// An array index or slice bound lies outside the I-JSON safe-integer range
-    /// (see [`MIN_SAFE_INTEGER`]/[`MAX_SAFE_INTEGER`]).
+    /// An array index or slice bound lies outside the I-JSON interoperable
+    /// integer range `[-(2^53)+1, (2^53)-1]`.
     ///
     /// `repr` is the offending integer as it appeared in the query (kept as text
     /// because the value may not fit in an [`i64`]).

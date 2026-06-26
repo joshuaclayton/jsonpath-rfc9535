@@ -55,9 +55,9 @@
 //! [cts]: https://github.com/jsonpath-standard/jsonpath-compliance-test-suite
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-pub mod ast;
+mod ast;
 mod compiled;
-pub mod error;
+mod error;
 mod eval;
 #[cfg(feature = "regex")]
 mod iregexp;
