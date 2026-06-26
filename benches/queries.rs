@@ -100,7 +100,7 @@ fn bench_query(c: &mut Criterion) {
         let mut group = c.benchmark_group(format!("query/{label}"));
         for (size, document) in &documents {
             group.bench_function(*size, |b| {
-                b.iter(|| compiled.query(black_box(document)));
+                b.iter(|| compiled.query_values(black_box(document)));
             });
         }
         group.finish();

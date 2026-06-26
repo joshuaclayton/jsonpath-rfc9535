@@ -115,6 +115,17 @@ fn run_case(case: &Case) -> Result<(), String> {
     let got_values: Vec<&Value> = nodes.values().collect();
     let got_paths: Vec<String> = nodes.paths().map(ToString::to_string).collect();
 
+    // The path-free evaluator (`query_values`) must agree, value-for-value and in order,
+    // with the path-building one (`query`).
+    let values_only = path.query_values(document);
+    if values_only != got_values {
+        return Err(format!(
+            "query_values disagrees with query ({} vs {} values)",
+            values_only.len(),
+            got_values.len()
+        ));
+    }
+
     match (&case.result, &case.results) {
         (Some(values), _) => {
             let paths = case

@@ -41,13 +41,13 @@ impl JsonPath {
     }
 
     /// Evaluates the query against `root`, returning just the selected values in order.
+    ///
+    /// This skips normalized-path construction entirely, so it is substantially faster
+    /// than [`query`](Self::query) for wildcard- and descendant-heavy queries where the
+    /// caller does not need paths.
     #[must_use]
     pub fn query_values<'a>(&self, root: &'a Value) -> Vec<&'a Value> {
-        self.query(root)
-            .into_vec()
-            .into_iter()
-            .map(|node| node.value())
-            .collect()
+        crate::eval::evaluate_values(self.compiled(), root)
     }
 
     /// Returns the compiled query IR (consumed by the evaluator).

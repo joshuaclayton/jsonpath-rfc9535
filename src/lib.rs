@@ -82,3 +82,19 @@ pub use normalized_path::NormalizedPath;
 pub fn query<'a>(path: &str, root: &'a serde_json::Value) -> Result<NodeList<'a>, Error> {
     Ok(JsonPath::parse(path)?.query(root))
 }
+
+/// Compiles `path` and evaluates it against `root`, returning just the selected values.
+///
+/// Like [`query`] but skips normalized-path construction, so it is faster when the
+/// caller does not need paths. Prefer [`JsonPath::parse`] + [`JsonPath::query_values`]
+/// when applying the same query to multiple documents.
+///
+/// # Errors
+///
+/// Returns an [`Error`] if `path` is not a syntactically valid, well-typed query.
+pub fn query_values<'a>(
+    path: &str,
+    root: &'a serde_json::Value,
+) -> Result<Vec<&'a serde_json::Value>, Error> {
+    Ok(JsonPath::parse(path)?.query_values(root))
+}

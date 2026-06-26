@@ -17,28 +17,73 @@ use core::cmp::Ordering;
 use serde_json::{Number, Value};
 use std::borrow::Cow;
 
-/// A located node during evaluation: its path and a borrow of its value.
-type Located<'a> = (NormalizedPath, &'a Value);
+/// How a node's location is tracked during traversal.
+///
+/// [`NormalizedPath`] builds the real path (for [`evaluate`], which fills a
+/// [`NodeList`]). The no-op [`()`](unit) implementation is zero-sized, so value-only
+/// queries ([`evaluate_values`]) and every filter sub-query skip path construction
+/// entirely — the per-node `Rc` allocation that dominates wildcard/descendant traversal.
+trait Position: Clone {
+    /// The position of object member `name` reached from here.
+    fn descend_name(&self, name: &str) -> Self;
+    /// The position of array element `index` reached from here.
+    fn descend_index(&self, index: usize) -> Self;
+}
 
-/// Evaluates `query` against `root`, returning the selected nodelist.
-pub fn evaluate<'a>(query: &Query, root: &'a Value) -> NodeList<'a> {
-    let mut nodes: Vec<Located<'a>> = vec![(NormalizedPath::root(), root)];
-    for segment in &query.segments {
-        nodes = apply_segment(segment, &nodes, root);
+impl Position for NormalizedPath {
+    fn descend_name(&self, name: &str) -> Self {
+        self.child_name(name)
     }
+    fn descend_index(&self, index: usize) -> Self {
+        self.child_index(index)
+    }
+}
+
+impl Position for () {
+    fn descend_name(&self, _name: &str) -> Self {}
+    fn descend_index(&self, _index: usize) -> Self {}
+}
+
+/// Evaluates `query` against `root`, returning the selected nodelist with normalized
+/// paths.
+pub fn evaluate<'a>(query: &Query, root: &'a Value) -> NodeList<'a> {
     NodeList::new(
-        nodes
+        walk(&query.segments, NormalizedPath::root(), root, root)
             .into_iter()
             .map(|(path, value)| LocatedNode::new(path, value))
             .collect(),
     )
 }
 
-fn apply_segment<'a>(
-    segment: &Segment,
-    input: &[Located<'a>],
+/// Evaluates `query` against `root`, returning just the selected values in order.
+/// Tracks no paths (`P = ()`), so traversal performs no path allocation.
+pub fn evaluate_values<'a>(query: &Query, root: &'a Value) -> Vec<&'a Value> {
+    walk(&query.segments, (), root, root)
+        .into_iter()
+        .map(|((), value)| value)
+        .collect()
+}
+
+/// Threads `segments` from `(start, start_value)`, carrying `root` for absolute filter
+/// sub-queries. Generic over how positions are tracked (see [`Position`]).
+fn walk<'a, P: Position>(
+    segments: &[Segment],
+    start: P,
+    start_value: &'a Value,
     root: &'a Value,
-) -> Vec<Located<'a>> {
+) -> Vec<(P, &'a Value)> {
+    let mut nodes: Vec<(P, &'a Value)> = vec![(start, start_value)];
+    for segment in segments {
+        nodes = apply_segment(segment, &nodes, root);
+    }
+    nodes
+}
+
+fn apply_segment<'a, P: Position>(
+    segment: &Segment,
+    input: &[(P, &'a Value)],
+    root: &'a Value,
+) -> Vec<(P, &'a Value)> {
     let mut result = Vec::new();
     match segment {
         Segment::Child(selectors) => {
@@ -70,29 +115,29 @@ fn apply_segment<'a>(
 
 /// Collects a node and all of its descendants in pre-order (a node before its
 /// descendants; array elements in order; object members in map order).
-fn collect_descendants<'a>(path: &NormalizedPath, value: &'a Value, out: &mut Vec<Located<'a>>) {
+fn collect_descendants<'a, P: Position>(path: &P, value: &'a Value, out: &mut Vec<(P, &'a Value)>) {
     out.push((path.clone(), value));
     match value {
         Value::Array(elements) => {
             for (index, element) in elements.iter().enumerate() {
-                collect_descendants(&path.child_index(index), element, out);
+                collect_descendants(&path.descend_index(index), element, out);
             }
         }
         Value::Object(members) => {
             for (key, member) in members {
-                collect_descendants(&path.child_name(key), member, out);
+                collect_descendants(&path.descend_name(key), member, out);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
-fn apply_selector<'a>(
+fn apply_selector<'a, P: Position>(
     selector: &Selector,
-    path: &NormalizedPath,
+    path: &P,
     value: &'a Value,
     root: &'a Value,
-) -> Vec<Located<'a>> {
+) -> Vec<(P, &'a Value)> {
     match selector {
         Selector::Name(name) => apply_name(name, path, value).into_iter().collect(),
         Selector::Wildcard => apply_wildcard(path, value),
@@ -102,43 +147,43 @@ fn apply_selector<'a>(
     }
 }
 
-fn apply_name<'a>(name: &str, path: &NormalizedPath, value: &'a Value) -> Option<Located<'a>> {
+fn apply_name<'a, P: Position>(name: &str, path: &P, value: &'a Value) -> Option<(P, &'a Value)> {
     value
         .as_object()
         .and_then(|members| members.get(name))
-        .map(|member| (path.child_name(name), member))
+        .map(|member| (path.descend_name(name), member))
 }
 
-fn apply_wildcard<'a>(path: &NormalizedPath, value: &'a Value) -> Vec<Located<'a>> {
+fn apply_wildcard<'a, P: Position>(path: &P, value: &'a Value) -> Vec<(P, &'a Value)> {
     match value {
         Value::Array(elements) => elements
             .iter()
             .enumerate()
-            .map(|(index, element)| (path.child_index(index), element))
+            .map(|(index, element)| (path.descend_index(index), element))
             .collect(),
         Value::Object(members) => members
             .iter()
-            .map(|(key, member)| (path.child_name(key), member))
+            .map(|(key, member)| (path.descend_name(key), member))
             .collect(),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Vec::new(),
     }
 }
 
-fn apply_index<'a>(
+fn apply_index<'a, P: Position>(
     index: ast::JsonInt,
-    path: &NormalizedPath,
+    path: &P,
     value: &'a Value,
-) -> Option<Located<'a>> {
+) -> Option<(P, &'a Value)> {
     let elements = value.as_array()?;
     let (resolved, element) = element_at(elements, normalize(index.get(), elements.len())?)?;
-    Some((path.child_index(resolved), element))
+    Some((path.descend_index(resolved), element))
 }
 
-fn apply_slice<'a>(
+fn apply_slice<'a, P: Position>(
     slice: &ast::Slice,
-    path: &NormalizedPath,
+    path: &P,
     value: &'a Value,
-) -> Vec<Located<'a>> {
+) -> Vec<(P, &'a Value)> {
     let Some(elements) = value.as_array() else {
         return Vec::new();
     };
@@ -162,7 +207,7 @@ fn apply_slice<'a>(
     let mut index = if step > 0 { lower } else { upper };
     while (step > 0 && index < upper) || (step < 0 && lower < index) {
         if let Some((resolved, element)) = element_at(elements, index) {
-            out.push((path.child_index(resolved), element));
+            out.push((path.descend_index(resolved), element));
         }
         index = index.saturating_add(step);
     }
@@ -197,23 +242,23 @@ fn element_at(elements: &[Value], index: i64) -> Option<(usize, &Value)> {
     elements.get(resolved).map(|element| (resolved, element))
 }
 
-fn apply_filter<'a>(
+fn apply_filter<'a, P: Position>(
     expr: &LogicalExpr,
-    path: &NormalizedPath,
+    path: &P,
     value: &'a Value,
     root: &'a Value,
-) -> Vec<Located<'a>> {
+) -> Vec<(P, &'a Value)> {
     match value {
         Value::Array(elements) => elements
             .iter()
             .enumerate()
             .filter(|(_, element)| eval_logical(expr, element, root))
-            .map(|(index, element)| (path.child_index(index), element))
+            .map(|(index, element)| (path.descend_index(index), element))
             .collect(),
         Value::Object(members) => members
             .iter()
             .filter(|(_, member)| eval_logical(expr, member, root))
-            .map(|(key, member)| (path.child_name(key), member))
+            .map(|(key, member)| (path.descend_name(key), member))
             .collect(),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Vec::new(),
     }
@@ -221,22 +266,19 @@ fn apply_filter<'a>(
 
 // ---- Filter expression evaluation ------------------------------------------------
 
-/// Evaluates a relative (`@`) or absolute (`$`) query inside a filter, returning its
-/// nodelist (paths are placeholders here, as filters observe only values/cardinality).
+/// Evaluates a relative (`@`) or absolute (`$`) query inside a filter, returning the
+/// values it selects. Filters observe only values and cardinality, so this skips path
+/// construction entirely (`P = ()`).
 fn eval_filter_query<'a>(
     query: &FilterQuery,
     current: &'a Value,
     root: &'a Value,
-) -> Vec<Located<'a>> {
+) -> Vec<((), &'a Value)> {
     let start = match query.root {
         ast::QueryRoot::Current => current,
         ast::QueryRoot::Root => root,
     };
-    let mut nodes: Vec<Located<'a>> = vec![(NormalizedPath::root(), start)];
-    for segment in &query.segments {
-        nodes = apply_segment(segment, &nodes, root);
-    }
-    nodes
+    walk(&query.segments, (), start, root)
 }
 
 fn eval_logical<'a>(expr: &LogicalExpr, current: &'a Value, root: &'a Value) -> bool {
@@ -329,7 +371,7 @@ fn eval_value_function<'a>(
             eval_filter_query(query, current, root).len(),
         ))),
         Function::Value(query) => match eval_filter_query(query, current, root).as_slice() {
-            [(_, value)] => Comparand::Value(Cow::Borrowed(value)),
+            [((), value)] => Comparand::Value(Cow::Borrowed(value)),
             _ => Comparand::Nothing,
         },
         Function::Match(..) | Function::Search(..) => Comparand::Nothing,

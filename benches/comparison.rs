@@ -75,7 +75,7 @@ const CASES: &[Case] = &[
 ];
 
 fn count_jp_full(document: &Value, rfc: &str) -> usize {
-    JpFull::parse(rfc).map_or(0, |query| query.query(document).len())
+    JpFull::parse(rfc).map_or(0, |query| query.query_values(document).len())
 }
 
 fn count_jsonpath_lib(document: &Value, goessner: &str) -> usize {
@@ -128,7 +128,7 @@ fn bench_eval(c: &mut Criterion) {
             let mut group = c.benchmark_group(format!("eval/{size}/{}", case.label));
             if let Ok(query) = JpFull::parse(case.rfc) {
                 group.bench_function("jp-full", |b| {
-                    b.iter(|| query.query(black_box(&document)));
+                    b.iter(|| query.query_values(black_box(&document)));
                 });
             }
             if let Some(goessner) = case.goessner
@@ -149,7 +149,7 @@ fn bench_end_to_end(c: &mut Criterion) {
         for case in CASES {
             let mut group = c.benchmark_group(format!("e2e/{size}/{}", case.label));
             group.bench_function("jp-full", |b| {
-                b.iter(|| jp_full::query(black_box(case.rfc), black_box(&document)));
+                b.iter(|| jp_full::query_values(black_box(case.rfc), black_box(&document)));
             });
             if let Some(goessner) = case.goessner {
                 group.bench_function("jsonpath_lib", |b| {
