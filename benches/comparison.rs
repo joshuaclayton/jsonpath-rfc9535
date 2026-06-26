@@ -23,9 +23,26 @@ use jp_full::JsonPath as JpFull;
 use jsonpath_rust::JsonPath as _;
 use serde_json::Value;
 use std::hint::black_box;
+use std::path::Path;
 
-const BOOKSTORE_1K: &str = include_str!("data/bookstore-1k.json");
-const BOOKSTORE_10K: &str = include_str!("data/bookstore-10k.json");
+/// Fixture sizes (book counts) loaded from `benches/data/` at runtime. Generate them
+/// with `benches/data/generate.py`; any missing size is skipped.
+const FIXTURES: &[(&str, &str)] = &[
+    ("1k", "bookstore-1k.json"),
+    ("10k", "bookstore-10k.json"),
+    ("25k", "bookstore-25k.json"),
+    ("50k", "bookstore-50k.json"),
+    ("100k", "bookstore-100k.json"),
+];
+
+fn load(file: &str) -> Option<Value> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("benches/data")
+        .join(file);
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
 
 /// One comparison case: the same selection expressed in each dialect. `rfc` drives
 /// jp-full and jsonpath-rust; `goessner` drives `jsonpath_lib` (its filters need the
@@ -110,13 +127,10 @@ fn assert_equivalent(size: &str, document: &Value, case: &Case) {
 }
 
 fn fixtures() -> Vec<(&'static str, Value)> {
-    let mut documents = Vec::new();
-    for (label, raw) in [("1k", BOOKSTORE_1K), ("10k", BOOKSTORE_10K)] {
-        if let Ok(value) = serde_json::from_str::<Value>(raw) {
-            documents.push((label, value));
-        }
-    }
-    documents
+    FIXTURES
+        .iter()
+        .filter_map(|&(label, file)| load(file).map(|value| (label, value)))
+        .collect()
 }
 
 /// Pre-compiled evaluation only: jp-full vs `jsonpath_lib` (both compile once, query

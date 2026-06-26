@@ -13,10 +13,14 @@ Deterministic: seeded PRNG, no timestamps, so re-running produces byte-identical
 
 import json
 import random
+import sys
 from pathlib import Path
 
 CATEGORIES = ["reference", "fiction", "biography", "technical", "poetry"]
-SIZES = {"1k": 1_000, "10k": 10_000}
+SIZES = {"1k": 1_000, "10k": 10_000, "25k": 25_000, "50k": 50_000, "100k": 100_000}
+# Written by default; the larger 50k/100k (~10/21 MB) are opt-in to keep routine
+# `just bench` light: `python3 benches/data/generate.py 50k 100k`.
+DEFAULT_SIZES = ["1k", "10k", "25k"]
 
 
 def book(rng: random.Random, index: int) -> dict:
@@ -47,12 +51,19 @@ def store(count: int) -> dict:
 
 
 def main() -> None:
+    requested = sys.argv[1:] or DEFAULT_SIZES
     here = Path(__file__).parent
-    for label, count in SIZES.items():
+    for label in requested:
+        if label not in SIZES:
+            print(f"unknown size {label!r}; choose from {', '.join(SIZES)}")
+            continue
         path = here / f"bookstore-{label}.json"
-        text = json.dumps(store(count), separators=(",", ":"))
+        if path.exists():
+            print(f"{path.name}: present, skipping")
+            continue
+        text = json.dumps(store(SIZES[label]), separators=(",", ":"))
         path.write_text(text + "\n")
-        print(f"{path.name}: {count} books, {len(text):,} bytes")
+        print(f"{path.name}: {SIZES[label]} books, {len(text):,} bytes")
 
 
 if __name__ == "__main__":

@@ -49,21 +49,27 @@ release:
 # Criterion baselines persist under .criterion/ (gitignored) so they survive `cargo clean`.
 CRITERION_HOME := ".criterion"
 
+# Generate the standard benchmark fixtures (idempotent). For larger scales:
+# `python3 benches/data/generate.py 50k 100k`.
+[group('dev')]
+bench-fixtures:
+  python3 benches/data/generate.py
+
 # Run the criterion benchmarks. Pass criterion args after `--`, e.g.
 # `just bench -- --baseline main` to compare against the saved baseline, or
 # `just bench -- parse/child` to filter.
 [group('dev')]
-bench *ARGS:
+bench *ARGS: bench-fixtures
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --bench queries {{ ARGS }}
 
 # Cross-library comparison (jp-full vs jsonpath_lib / jsonpath-rust). Same `-- <args>` form.
 [group('dev')]
-bench-compare *ARGS:
+bench-compare *ARGS: bench-fixtures
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --features compare --bench comparison {{ ARGS }}
 
 # Save the current numbers as the `main` baseline (the "where we started" reference).
 [group('dev')]
-bench-save-baseline:
+bench-save-baseline: bench-fixtures
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --bench queries -- --save-baseline main
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --features compare --bench comparison -- --save-baseline main
 

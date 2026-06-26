@@ -4,3 +4,6 @@
 /.criterion
 # Per-user, machine-specific Claude Code settings.
 /.claude/settings.local.json
+# Benchmark fixtures are generated on demand by benches/data/generate.py (up to ~21MB);
+# regenerate rather than commit them.
+/benches/data/*.json

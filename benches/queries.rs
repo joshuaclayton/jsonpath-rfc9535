@@ -10,6 +10,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use jp_full::JsonPath;
 use serde_json::{Value, json};
 use std::hint::black_box;
+use std::path::Path;
 
 /// The RFC 9535 running-example document (the smallest scale point).
 fn bookstore() -> Value {
@@ -48,18 +49,34 @@ fn bookstore() -> Value {
     })
 }
 
-const BOOKSTORE_1K: &str = include_str!("data/bookstore-1k.json");
-const BOOKSTORE_10K: &str = include_str!("data/bookstore-10k.json");
+/// Fixture sizes loaded from `benches/data/` at runtime (generate with
+/// `benches/data/generate.py`); any missing size is skipped.
+const FIXTURES: &[(&str, &str)] = &[
+    ("1k", "bookstore-1k.json"),
+    ("10k", "bookstore-10k.json"),
+    ("25k", "bookstore-25k.json"),
+    ("50k", "bookstore-50k.json"),
+    ("100k", "bookstore-100k.json"),
+];
 
-/// `(label, document)` at increasing scale; the two large entries are parsed from the
-/// committed fixtures.
+fn load(file: &str) -> Option<Value> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("benches/data")
+        .join(file);
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+/// `(label, document)` at increasing scale: the tiny inline bookstore plus whichever
+/// generated fixtures are present.
 fn documents() -> Vec<(&'static str, Value)> {
     let mut documents = vec![("small", bookstore())];
-    for (label, raw) in [("1k", BOOKSTORE_1K), ("10k", BOOKSTORE_10K)] {
-        if let Ok(value) = serde_json::from_str::<Value>(raw) {
-            documents.push((label, value));
-        }
-    }
+    documents.extend(
+        FIXTURES
+            .iter()
+            .filter_map(|&(label, file)| load(file).map(|value| (label, value))),
+    );
     documents
 }
 
