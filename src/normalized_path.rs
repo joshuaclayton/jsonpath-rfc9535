@@ -12,10 +12,14 @@ use core::fmt;
 use std::rc::Rc;
 
 /// One step of a normalized path: a member name or an array index.
+///
+/// The member name is borrowed (`&'a str`) directly from the queried document's map
+/// keys — the normalized name of a selected node is always one of those keys — so
+/// extending a path costs only the parent-chain [`Rc`], never a string allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Step {
+enum Step<'a> {
     /// An object member, rendered as `['name']` with §2.7 escaping.
-    Name(Rc<str>),
+    Name(&'a str),
     /// An array element, rendered as `[index]`.
     Index(usize),
 }
@@ -23,8 +27,8 @@ enum Step {
 /// A node in the shared parent-chain. The chain runs leaf → root; the root itself
 /// is represented by `None` (an empty [`NormalizedPath`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Link {
-    step: Step,
+struct Link<'a> {
+    step: Step<'a>,
     parent: Option<Rc<Self>>,
 }
 
@@ -34,12 +38,17 @@ struct Link {
 /// [`child_name`](NormalizedPath::child_name) / [`child_index`](NormalizedPath::child_index);
 /// each returns a new path that shares its ancestors with the original. Render it
 /// with [`Display`](fmt::Display) (or [`ToString`]) to get the `$['a'][3]` form.
+///
+/// The lifetime `'a` ties a path to the document it locates a node in: member-name
+/// steps borrow the document's map keys rather than copying them, so a path cannot
+/// outlive that document (neither can a [`NodeList`](crate::NodeList), which borrows
+/// the selected values themselves).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizedPath {
-    head: Option<Rc<Link>>,
+pub struct NormalizedPath<'a> {
+    head: Option<Rc<Link<'a>>>,
 }
 
-impl NormalizedPath {
+impl<'a> NormalizedPath<'a> {
     /// The path of the document root, `$`.
     #[must_use]
     pub const fn root() -> Self {
@@ -48,8 +57,8 @@ impl NormalizedPath {
 
     /// Returns the path of the object member `name` reached from this path.
     #[must_use]
-    pub fn child_name(&self, name: &str) -> Self {
-        self.push(Step::Name(Rc::from(name)))
+    pub fn child_name(&self, name: &'a str) -> Self {
+        self.push(Step::Name(name))
     }
 
     /// Returns the path of the array element at `index` reached from this path.
@@ -58,7 +67,7 @@ impl NormalizedPath {
         self.push(Step::Index(index))
     }
 
-    fn push(&self, step: Step) -> Self {
+    fn push(&self, step: Step<'a>) -> Self {
         Self {
             head: Some(Rc::new(Link {
                 step,
@@ -68,17 +77,17 @@ impl NormalizedPath {
     }
 }
 
-impl Default for NormalizedPath {
+impl Default for NormalizedPath<'_> {
     fn default() -> Self {
         Self::root()
     }
 }
 
-impl fmt::Display for NormalizedPath {
+impl fmt::Display for NormalizedPath<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("$")?;
         // The chain is stored leaf → root; collect it so we can render root → leaf.
-        let steps: Vec<&Step> =
+        let steps: Vec<&Step<'_>> =
             core::iter::successors(self.head.as_deref(), |link| link.parent.as_deref())
                 .map(|link| &link.step)
                 .collect();

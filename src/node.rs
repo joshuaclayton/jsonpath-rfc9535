@@ -11,18 +11,18 @@ use serde_json::Value;
 /// A single selected node: the JSON value plus its normalized location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocatedNode<'a> {
-    path: NormalizedPath,
+    path: NormalizedPath<'a>,
     node: &'a Value,
 }
 
 impl<'a> LocatedNode<'a> {
-    pub(crate) const fn new(path: NormalizedPath, node: &'a Value) -> Self {
+    pub(crate) const fn new(path: NormalizedPath<'a>, node: &'a Value) -> Self {
         Self { path, node }
     }
 
     /// The normalized path identifying this node within the queried document.
     #[must_use]
-    pub const fn path(&self) -> &NormalizedPath {
+    pub const fn path(&self) -> &NormalizedPath<'a> {
         &self.path
     }
 
@@ -70,7 +70,7 @@ impl<'a> NodeList<'a> {
     }
 
     /// Iterates over the normalized paths of the selected nodes.
-    pub fn paths(&self) -> impl Iterator<Item = &NormalizedPath> + '_ {
+    pub fn paths(&self) -> impl Iterator<Item = &NormalizedPath<'a>> + '_ {
         self.nodes.iter().map(LocatedNode::path)
     }
 

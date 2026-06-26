@@ -125,7 +125,39 @@ Two filter cost centres, each validated by a dedicated bench (`filter_exists`, `
 
 Numeric comparison (`?@.price < 10`) is unchanged-to-−6% (no heap literal to save). Both changes touch only the filter IR (`Comparable`/`ValueArg`/`ExistenceTest`); non-filter query shapes are unaffected (verified within the ±5% noise floor vs the committed baseline). The literal is `Box`ed to keep `Selector`/`Comparable` small (an inline `Value` tripped `large_enum_variant`).
 
+### Borrowed path names (paths API)
+
+`NormalizedPath` construction was the biggest measured cost for the **paths** API
+(`micro/path_overhead`: 4.2×–13.8× the value path): each name step did *two*
+allocations — the parent-chain `Rc<Link>` plus an `Rc::from(name)` that copied the
+member name. But the normalized name of a selected node is always one of the queried
+document's own map keys, so it can be *borrowed* instead of copied. `NormalizedPath`
+now carries a lifetime (`NormalizedPath<'a>`) and stores `Step::Name(&'a str)`; the
+evaluator obtains the document key via `Map::get_key_value` at each name step. This
+removes the per-name-step string allocation entirely (only the `Rc<Link>` remains).
+
+A/B (`micro/path_overhead`, query() vs query_values):
+
+| query @10k | paths before | paths after | change |
+|---|---|---|---|
+| `$.store.book[*].author` | 754 µs | ~571 µs | **−24%** |
+| `$..price` | 5.34 ms | ~3.16 ms | **−41%** |
+| `$..*` | 10.62 ms | ~6.23 ms | **−41%** |
+
+The value path (`query_values`) is unaffected — `get_key_value` is equivalent work to
+`get`, and the `()` position implementation ignores the borrowed name. Verified neutral
+vs the committed baseline; CTS 703/703 (values + normalized paths) still passes, so paths
+render identically.
+
+API note: `NormalizedPath` gaining a lifetime is a breaking change (a path can no longer
+outlive the document it locates into — neither could a `NodeList`, which already borrows
+the selected values). Acceptable at 0.1.0 / pre-publication.
+
 ### Known remaining lever (not taken)
 
-`NormalizedPath` construction is the biggest measured cost for the **paths** API (`micro/path_overhead`: 4.2×–13.8× the value path) — each descent does `Rc::new(Link)` + `Rc::from(name)` for every node visited. Reducing it means lazy/deferred path construction (build only for selected nodes), a substantial redesign that affects `query()` only (`query_values` is already path-free). Validated as expensive; left for a deliberate, signed-off effort rather than folded in here.
+For the paths API, what remains is the `Rc<Link>` allocation per *visited* node during
+descendant traversal (paths are built for nodes that are walked-through but not selected).
+Eliminating it means lazy/deferred path construction (materialise only for selected
+nodes) — a larger redesign. `query_values` is already path-free, so this affects `query()`
+only.
 

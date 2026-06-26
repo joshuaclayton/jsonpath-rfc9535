@@ -24,16 +24,17 @@ use std::borrow::Cow;
 /// [`NodeList`]). The no-op [`()`](unit) implementation is zero-sized, so value-only
 /// queries ([`evaluate_values`]) and every filter sub-query skip path construction
 /// entirely — the per-node `Rc` allocation that dominates wildcard/descendant traversal.
-trait Position: Clone {
-    /// The position of object member `name` reached from here.
-    fn descend_name(&self, name: &str) -> Self;
+trait Position<'a>: Clone {
+    /// The position of object member `name` (a key borrowed from the document) reached
+    /// from here.
+    fn descend_name(&self, name: &'a str) -> Self;
     /// The position of array element `index` reached from here.
     fn descend_index(&self, index: usize) -> Self;
 }
 
-impl Position for NormalizedPath {
+impl<'a> Position<'a> for NormalizedPath<'a> {
     #[inline]
-    fn descend_name(&self, name: &str) -> Self {
+    fn descend_name(&self, name: &'a str) -> Self {
         self.child_name(name)
     }
     #[inline]
@@ -42,9 +43,9 @@ impl Position for NormalizedPath {
     }
 }
 
-impl Position for () {
+impl<'a> Position<'a> for () {
     #[inline]
-    fn descend_name(&self, _name: &str) -> Self {}
+    fn descend_name(&self, _name: &'a str) -> Self {}
     #[inline]
     fn descend_index(&self, _index: usize) -> Self {}
 }
@@ -101,14 +102,17 @@ pub fn evaluate_singular_values<'a>(query: &ast::SingularQuery, root: &'a Value)
 fn eval_singular_located<'a>(
     query: &ast::SingularQuery,
     root: &'a Value,
-) -> Option<(NormalizedPath, &'a Value)> {
+) -> Option<(NormalizedPath<'a>, &'a Value)> {
     let mut value = root;
     let mut path = NormalizedPath::root();
     for segment in &query.segments {
         match segment {
             ast::SingularSegment::Name(name) => {
-                value = value.as_object()?.get(name)?;
-                path = path.child_name(name);
+                // Borrow the document's own key for the path (it equals `name`), so the
+                // path step costs no string allocation.
+                let (key, member) = value.as_object()?.get_key_value(name)?;
+                value = member;
+                path = path.child_name(key);
             }
             ast::SingularSegment::Index(index) => {
                 let elements = value.as_array()?;
@@ -124,7 +128,7 @@ fn eval_singular_located<'a>(
 
 /// Threads `segments` from `(start, start_value)`, carrying `root` for absolute filter
 /// sub-queries. Generic over how positions are tracked (see [`Position`]).
-fn walk<'a, P: Position>(
+fn walk<'a, P: Position<'a>>(
     segments: &[Segment],
     start: P,
     start_value: &'a Value,
@@ -145,7 +149,7 @@ fn walk<'a, P: Position>(
 /// Applies `segment` to every node in `input`, pushing selected nodes into `out`.
 /// Selectors push directly into `out` — no per-node or per-selector intermediate
 /// vector — and the descendant walk is fused with selection (see [`descend`]).
-fn apply_segment<'a, P: Position>(
+fn apply_segment<'a, P: Position<'a>>(
     segment: &Segment,
     input: &[(P, &'a Value)],
     root: &'a Value,
@@ -175,7 +179,7 @@ fn apply_segment<'a, P: Position>(
 /// Specialized `$..name` descendant: pushes every object member named `name`, reachable
 /// at any depth, in pre-order. Mirrors the general `descend` for a single name selector
 /// but without per-node dispatch.
-fn descend_name<'a, P: Position>(
+fn descend_name<'a, P: Position<'a>>(
     name: &str,
     path: &P,
     value: &'a Value,
@@ -183,8 +187,8 @@ fn descend_name<'a, P: Position>(
 ) {
     match value {
         Value::Object(members) => {
-            if let Some(member) = members.get(name) {
-                out.push((path.descend_name(name), member));
+            if let Some((key, member)) = members.get_key_value(name) {
+                out.push((path.descend_name(key), member));
             }
             for (key, member) in members {
                 descend_name(name, &path.descend_name(key), member, out);
@@ -202,7 +206,7 @@ fn descend_name<'a, P: Position>(
 /// Applies `selectors` to `value` and every descendant in pre-order (a node before its
 /// descendants; array elements in order; object members in map order), pushing matches
 /// into `out`. Fused with the traversal, so the full descendant set is never collected.
-fn descend<'a, P: Position>(
+fn descend<'a, P: Position<'a>>(
     selectors: &[Selector],
     path: &P,
     value: &'a Value,
@@ -228,7 +232,7 @@ fn descend<'a, P: Position>(
 }
 
 #[inline]
-fn apply_selector<'a, P: Position>(
+fn apply_selector<'a, P: Position<'a>>(
     selector: &Selector,
     path: &P,
     value: &'a Value,
@@ -245,19 +249,22 @@ fn apply_selector<'a, P: Position>(
 }
 
 #[inline]
-fn apply_name<'a, P: Position>(
+fn apply_name<'a, P: Position<'a>>(
     name: &str,
     path: &P,
     value: &'a Value,
     out: &mut Vec<(P, &'a Value)>,
 ) {
-    if let Some(member) = value.as_object().and_then(|members| members.get(name)) {
-        out.push((path.descend_name(name), member));
+    if let Some((key, member)) = value
+        .as_object()
+        .and_then(|members| members.get_key_value(name))
+    {
+        out.push((path.descend_name(key), member));
     }
 }
 
 #[inline]
-fn apply_wildcard<'a, P: Position>(path: &P, value: &'a Value, out: &mut Vec<(P, &'a Value)>) {
+fn apply_wildcard<'a, P: Position<'a>>(path: &P, value: &'a Value, out: &mut Vec<(P, &'a Value)>) {
     match value {
         Value::Array(elements) => {
             out.reserve(elements.len());
@@ -276,7 +283,7 @@ fn apply_wildcard<'a, P: Position>(path: &P, value: &'a Value, out: &mut Vec<(P,
 }
 
 #[inline]
-fn apply_index<'a, P: Position>(
+fn apply_index<'a, P: Position<'a>>(
     index: ast::JsonInt,
     path: &P,
     value: &'a Value,
@@ -290,7 +297,7 @@ fn apply_index<'a, P: Position>(
     }
 }
 
-fn apply_slice<'a, P: Position>(
+fn apply_slice<'a, P: Position<'a>>(
     slice: &ast::Slice,
     path: &P,
     value: &'a Value,
@@ -353,7 +360,7 @@ fn element_at(elements: &[Value], index: i64) -> Option<(usize, &Value)> {
 }
 
 #[inline]
-fn apply_filter<'a, P: Position>(
+fn apply_filter<'a, P: Position<'a>>(
     expr: &LogicalExpr,
     path: &P,
     value: &'a Value,
