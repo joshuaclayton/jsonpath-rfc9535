@@ -190,17 +190,31 @@ fn descend_name<'a, P: Position<'a>>(
             if let Some((key, member)) = members.get_key_value(name) {
                 out.push((path.descend_name(key), member));
             }
+            // Only descend into members that can actually contain a deeper match — a
+            // scalar has no descendants, so building the path step to recurse into it
+            // (an `Rc<Link>` for the path API) would be pure waste.
             for (key, member) in members {
-                descend_name(name, &path.descend_name(key), member, out);
+                if is_container(member) {
+                    descend_name(name, &path.descend_name(key), member, out);
+                }
             }
         }
         Value::Array(elements) => {
             for (index, element) in elements.iter().enumerate() {
-                descend_name(name, &path.descend_index(index), element, out);
+                if is_container(element) {
+                    descend_name(name, &path.descend_index(index), element, out);
+                }
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
+}
+
+/// Whether `value` has descendants (an object or array) — used to prune descendant
+/// recursion into scalars, which can never contain a deeper match.
+#[inline]
+const fn is_container(value: &Value) -> bool {
+    matches!(value, Value::Object(_) | Value::Array(_))
 }
 
 /// Applies `selectors` to `value` and every descendant in pre-order (a node before its
@@ -219,12 +233,16 @@ fn descend<'a, P: Position<'a>>(
     match value {
         Value::Array(elements) => {
             for (index, element) in elements.iter().enumerate() {
-                descend(selectors, &path.descend_index(index), element, root, out);
+                if is_container(element) {
+                    descend(selectors, &path.descend_index(index), element, root, out);
+                }
             }
         }
         Value::Object(members) => {
             for (key, member) in members {
-                descend(selectors, &path.descend_name(key), member, root, out);
+                if is_container(member) {
+                    descend(selectors, &path.descend_name(key), member, root, out);
+                }
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}

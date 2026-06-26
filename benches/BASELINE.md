@@ -153,11 +153,33 @@ API note: `NormalizedPath` gaining a lifetime is a breaking change (a path can n
 outlive the document it locates into — neither could a `NodeList`, which already borrows
 the selected values). Acceptable at 0.1.0 / pre-publication.
 
+### Pruned descendant recursion (lazy paths, the cheap form)
+
+Descendant traversal (`descend`/`descend_name`) recursed into *every* member/element,
+building a path step (`Rc<Link>` for the paths API) to do so — but a scalar has no
+descendants, so recursing into it can never select anything. Guarding the recursion on
+`is_container` (object/array) skips that dead-end work: no path step is built to descend
+into a leaf. This is the cheap, low-risk form of "lazy" path construction — don't build a
+path you'll throw away — and it captured more than a full trail-based deferral would have:
+
+| micro @10k | before | after | change |
+|---|---|---|---|
+| `$..price` paths | ~3.16 ms | ~1.4 ms | **−56%** |
+| `$..*` paths | ~6.23 ms | ~4.2 ms | **−33%** |
+| `$..*` values | ~790 µs | ~535 µs | **−32%** |
+| `$..price` values | ~665 µs | ~635 µs | −4% |
+
+It helps the **value** path too (skipping the per-leaf `descend` call — `apply_selector`
++ match — that always selected nothing), which a deferred-materialisation rewrite would
+not. CTS 703/703 (values + normalized paths) still passes. Child/wildcard queries don't
+recurse, so they're unaffected.
+
 ### Known remaining lever (not taken)
 
-For the paths API, what remains is the `Rc<Link>` allocation per *visited* node during
-descendant traversal (paths are built for nodes that are walked-through but not selected).
-Eliminating it means lazy/deferred path construction (materialise only for selected
-nodes) — a larger redesign. `query_values` is already path-free, so this affects `query()`
-only.
+A full trail-based deferral (maintain a cheap step-stack during descent, materialise the
+`NormalizedPath` only at a selected node) would additionally avoid the `Rc<Link>` for
+*container* subtrees that contain no match (e.g. a `reviews` array under `$..price`). With
+the `is_container` prune already taking −56% off `$..price` paths, the remaining headroom
+is ~10–20% on that one query shape, at the cost of a new `Trail` trait + associated type
+and loss of prefix-sharing across matches — not worth it at this point.
 
