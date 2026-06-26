@@ -87,6 +87,8 @@ const QUERIES: &[(&str, &str)] = &[
     ("wildcard", "$.store.book[*].author"),
     ("descendant", "$..price"),
     ("filter_comparison", "$.store.book[?@.price < 10]"),
+    ("filter_exists", "$.store.book[?@.isbn]"),
+    ("filter_string_eq", "$.store.book[?@.category == 'fiction']"),
     (
         "filter_function",
         "$.store.book[?length(@.title) > 10].title",
@@ -124,5 +126,53 @@ fn bench_query(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_parse, bench_query);
+/// Micro-benchmarks that isolate specific cost centres rather than whole-query timings,
+/// so a change can be attributed to the thing it touched.
+///
+/// * `micro/path_overhead/*` runs the same query over the 10k document twice — once via
+///   [`JsonPath::query_values`] (no paths) and once via [`JsonPath::query`] (which builds
+///   a `NormalizedPath` per selected node). The delta is exactly the path-construction
+///   cost — the per-node `Rc` allocation that the path-free value path avoids.
+/// * `micro/singular/*` exercises the singular fast path (pure name/index chains, which
+///   skip the worklist entirely) at increasing depth.
+fn bench_micro(c: &mut Criterion) {
+    let Some(document) = load("bookstore-10k.json") else {
+        return;
+    };
+
+    for (label, query) in [
+        ("wildcard", "$.store.book[*].author"),
+        ("descendant", "$..price"),
+        ("descendant_wildcard", "$..*"),
+    ] {
+        let Ok(compiled) = JsonPath::parse(query) else {
+            continue;
+        };
+        let mut group = c.benchmark_group(format!("micro/path_overhead/{label}"));
+        group.bench_function("values", |b| {
+            b.iter(|| compiled.query_values(black_box(&document)));
+        });
+        group.bench_function("paths", |b| {
+            b.iter(|| compiled.query(black_box(&document)));
+        });
+        group.finish();
+    }
+
+    let mut group = c.benchmark_group("micro/singular");
+    for (label, query) in [
+        ("depth1", "$.store"),
+        ("depth2", "$.store.book"),
+        ("depth4", "$.store.book[0].title"),
+    ] {
+        let Ok(compiled) = JsonPath::parse(query) else {
+            continue;
+        };
+        group.bench_function(label, |b| {
+            b.iter(|| compiled.query_values(black_box(&document)));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_parse, bench_query, bench_micro);
 criterion_main!(benches);

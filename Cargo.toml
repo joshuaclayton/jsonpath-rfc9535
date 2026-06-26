@@ -68,6 +68,8 @@ criterion = "0.8.2"
 jsonpath-rust = "1.0.4"
 jsonpath_lib = "0.3.0"
 proptest = "1.11.0"
+rsonpath-lib = "0.10"
+rsonpath-syntax = "0.4"
 serde = { version = "1.0.228", features = ["derive"] }
 
 [[bench]]

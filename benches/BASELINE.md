@@ -81,3 +81,51 @@ jp-full is **4–11× slower than jsonpath_lib** on wildcard/descendant queries,
 
 **Root cause (confirmed in `src/eval.rs`):** every traversal step allocates a `NormalizedPath` link (`Rc::new(Link)` via `child_name`/`child_index`) for each node visited — `collect_descendants` does this for the whole tree on `$..`, `apply_wildcard` for every child — and `query_values()` builds the full path-bearing `NodeList` then discards the paths. jsonpath_lib collects only `&Value`, with no per-node allocation. `search()` is ~on par with jsonpath-rust (regex dominates).
 
+---
+
+## Update 2026-06-26 — singular fast path + rsonpath reference
+
+The "Finding" above is the **original cold pre-optimisation snapshot**. Since then the path-free value path, streaming traversal, inlining, `$..name` specialisation, and buffer presizing landed (commits up to `ffab473`), making jp-full faster-or-equal to jsonpath_lib on every case. This update adds the **singular fast path** and a third comparison engine.
+
+### Singular fast path (this change)
+
+A query whose every segment is a single child name/index step (`$.a.b[0].c`) selects at most one node, so it needs no worklist and no per-segment `Vec`. `JsonPath` precomputes this form (`compiled::Query::singular`) and threads a single `&Value` down the document — eliminating ~5 small heap allocations per call. The general worklist path is left byte-for-byte unchanged (dispatch lives in `JsonPath::query`/`query_values`), so non-singular queries are algorithmically untouched.
+
+Headline effect (eval-only, jp-full vs jsonpath_lib, Apple M4 Pro, warm):
+
+| size | case | jp-full before | jp-full after | jsonpath_lib | after vs jsonpath_lib |
+|---|---|---|---|---|---|
+| 10k | child | 75 ns | **37 ns** (−51%) | 228 ns | **6.1× faster** (was ~3×) |
+
+`query/child/*` in `benches/queries.rs` shows the same −52% at every document size (the lookup is size-independent). Other shapes (`wildcard`, `descendant`, filters) move only within the ±5–10% layout/thermal noise floor at these scales — verified by opposite-sign deltas for the same query across harnesses/runs — i.e. no real regression.
+
+### rsonpath in the comparison bench (`scan/` group)
+
+`rsonpath` (0.10) is a raw-bytes + SIMD engine: it never builds a `serde_json::Value`. It can't share the `eval/` group (which times a *pre-parsed* DOM), so the new `scan/*` group times the full **text → matches** pipeline — `serde_json::from_str` + query for the DOM engines, a byte `count` for rsonpath. It covers only the non-filter cases (rsonpath has no filter support) and asserts node-count equivalence before benching.
+
+| scan/10k (text → matches) | jp-full (parse+query) | jsonpath_lib | rsonpath (count) |
+|---|---|---|---|
+| child | 10.8 ms | 10.9 ms | **435 µs** |
+| author_wildcard | 10.9 ms | 11.4 ms | **910 µs** |
+
+The DOM engines spend ~10.7 ms building a `Value` from the 2 MB document; the query itself is microseconds. rsonpath is ~12–25× faster here **only because it skips DOM construction** — the cost a `Value`-based engine pays up front and a byte engine never does. This is the honest framing: when you already hold a `Value` (parse once, query many — the `eval/` group), jp-full is the fast one; when you have raw text and scan once, a byte engine wins. The transferable byte-engine techniques (query→automaton, subtree pruning, allocation discipline) are already applied in `eval.rs`; SIMD structural classification does not apply to a materialised DOM.
+
+### New measurement tooling
+
+`benches/queries.rs` gained a `micro/*` group: `micro/path_overhead/*` runs the same query via `query_values` (no paths) and `query` (builds a `NormalizedPath` per node), so the delta is exactly the per-node `Rc` path-construction cost; `micro/singular/*` exercises the fast path at increasing depth.
+
+### Filter optimisations (validate → POC → A/B)
+
+Two filter cost centres, each validated by a dedicated bench (`filter_exists`, `filter_string_eq` in `queries.rs`), POC'd, then A/B'd against a same-session baseline:
+
+| filter @10k | before | after | change | mechanism |
+|---|---|---|---|---|
+| `?@.category == 'fiction'` | 456 µs | ~278 µs | **−39%** | precompute the comparison literal as a `serde_json::Value` once at compile time (`Comparable::Literal(Box<Value>)`) and borrow it, instead of rebuilding + heap-cloning the string on every element |
+| `?@.isbn` (existence) | 531 µs | ~190 µs | **−64%** (−64% @1k) | a *singular* existence sub-query (`?@.a.b`) becomes a path-free `eval_singular(...).is_some()` presence check (`ExistenceTest::Singular`), skipping the per-element nodelist `Vec`; non-singular existence still walks |
+
+Numeric comparison (`?@.price < 10`) is unchanged-to-−6% (no heap literal to save). Both changes touch only the filter IR (`Comparable`/`ValueArg`/`ExistenceTest`); non-filter query shapes are unaffected (verified within the ±5% noise floor vs the committed baseline). The literal is `Box`ed to keep `Selector`/`Comparable` small (an inline `Value` tripped `large_enum_variant`).
+
+### Known remaining lever (not taken)
+
+`NormalizedPath` construction is the biggest measured cost for the **paths** API (`micro/path_overhead`: 4.2×–13.8× the value path) — each descent does `Rc::new(Link)` + `Rc::from(name)` for every node visited. Reducing it means lazy/deferred path construction (build only for selected nodes), a substantial redesign that affects `query()` only (`query_values` is already path-free). Validated as expensive; left for a deliberate, signed-off effort rather than folded in here.
+
