@@ -33,8 +33,10 @@ impl JsonPath {
         })
     }
 
-    /// Evaluates the query against `root`, returning the selected nodelist (each value
-    /// paired with its normalized path). Borrows from `root`; never fails.
+    /// Evaluates the query against `root`, returning the selected nodelist — each value
+    /// paired with its [`NormalizedPath`](crate::NormalizedPath). Borrows from `root`
+    /// and never fails. Use [`query_values`](Self::query_values) when you don't need
+    /// the paths.
     #[must_use]
     pub fn query<'a>(&self, root: &'a Value) -> NodeList<'a> {
         self.query.singular.as_ref().map_or_else(

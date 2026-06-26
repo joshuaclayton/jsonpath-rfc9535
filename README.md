@@ -4,8 +4,8 @@ A complete, [RFC 9535](https://www.rfc-editor.org/rfc/rfc9535) compliant JSONPat
 query engine for [`serde_json`](https://docs.rs/serde_json) values.
 
 JSONPath selects a set of nodes — the *nodelist* — from a JSON document. `jp-full`
-compiles a query string once and evaluates it against any number of documents,
-returning the selected values together with their **normalized paths**.
+parses and type-checks a query string once and evaluates it against any number of
+documents, returning the selected values and, on request, their **normalized paths**.
 
 ## Features
 
@@ -18,6 +18,13 @@ returning the selected values together with their **normalized paths**.
   (`$['store']['book'][0]`) per RFC 9535 §2.7.
 - **Function extensions** — `length()`, `count()`, `value()`, plus `match()` and
   `search()` (I-Regexp, [RFC 9485](https://www.rfc-editor.org/rfc/rfc9485)).
+
+## Install
+
+```toml
+[dependencies]
+jp-full = "0.1"
+```
 
 ## Usage
 
@@ -47,8 +54,36 @@ let paths: Vec<_> = nodes.paths().map(ToString::to_string).collect();
 assert_eq!(paths, ["$['store']['book'][0]['title']"]);
 ```
 
-For a one-off query, the top-level `jp_full::query` function compiles and evaluates
-in a single call.
+### Values, or values and paths
+
+`query` returns a `NodeList` pairing each value with its normalized path. When you
+only need the values, `query_values` returns `Vec<&serde_json::Value>` and skips path
+construction entirely — appreciably faster for wildcard- and descendant-heavy queries:
+
+```rust
+let document = serde_json::json!({ "a": [1, 2, 3] });
+let query = jp_full::JsonPath::parse("$.a[*]").expect("valid query");
+let values = query.query_values(&document);
+assert_eq!(values.len(), 3);
+```
+
+For a one-off query, the top-level `jp_full::query` / `jp_full::query_values` functions
+compile and evaluate in a single call.
+
+## Performance
+
+Results borrow from the input document — no JSON value is cloned. `query_values` is
+path-free; `query` builds each node's `NormalizedPath` by borrowing the document's keys
+(no per-step string allocation). Literal `match()` / `search()` patterns are compiled to
+a regex once at `parse` time rather than per matched element. See [`benches/`](benches)
+for the micro-benchmarks and cross-library comparisons (`just bench`, `just bench-compare`).
+
+## Public API
+
+The surface is deliberately small: `JsonPath`, the `query` / `query_values` free
+functions, and the result types `NodeList`, `LocatedNode`, and `NormalizedPath` (plus
+`Error`). The grammar AST, the compiled IR, the parser, and the evaluator are private
+implementation details — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Cargo features
 

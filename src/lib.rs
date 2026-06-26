@@ -1,15 +1,15 @@
 //! `jp-full` — a complete, [RFC 9535] compliant JSONPath query engine for
 //! [`serde_json`] values.
 //!
-//! [RFC 9535] defines *JSONPath*, a query language that selects a set of nodes
-//! (the *nodelist*) from a JSON document. This crate compiles a query string once
-//! and evaluates it against any number of [`serde_json::Value`] documents,
-//! returning the selected nodes together with their *normalized paths*.
+//! [RFC 9535] defines *JSONPath*: a query language that selects a set of nodes — the
+//! *nodelist* — from a JSON document. This crate parses and type-checks a query once
+//! into a [`JsonPath`], then evaluates it against any number of [`serde_json::Value`]
+//! documents, returning the selected values and, on request, their *normalized paths*.
 //!
-//! # Examples
+//! # Quick start
 //!
-//! Compile a query once, then read back both the selected values and their
-//! normalized paths:
+//! Compile a query with [`JsonPath::parse`], then evaluate it. [`JsonPath::query`]
+//! returns a [`NodeList`] — each selected value paired with its [`NormalizedPath`]:
 //!
 //! ```
 //! use jp_full::JsonPath;
@@ -35,23 +35,52 @@
 //! # Ok::<(), jp_full::Error>(())
 //! ```
 //!
-//! For a one-off query, [`query`] compiles and evaluates in a single call.
+//! # Values, or values and paths
 //!
-//! # Conformance
+//! A compiled query evaluates two ways:
 //!
-//! Correctness is pinned to the official [JSONPath Compliance Test Suite][cts]: the
-//! engine is exercised against every case, including the ~250 that must be
-//! *rejected* at compile time.
+//! * [`JsonPath::query`] returns a [`NodeList`] of [`LocatedNode`]s — each a selected
+//!   value plus its [`NormalizedPath`], the node's canonical location within the
+//!   document (e.g. `$['store']['book'][0]`, per [RFC 9535 §2.7]).
+//! * [`JsonPath::query_values`] returns just the selected values
+//!   (`Vec<&serde_json::Value>`). It constructs no paths, so it is appreciably faster
+//!   for wildcard- and descendant-heavy queries where locations aren't needed.
+//!
+//! Either way the results *borrow* from the input document — no JSON value is cloned.
+//!
+//! # One-off queries
+//!
+//! When a query won't be reused, the crate-level [`query`] and [`query_values`]
+//! functions parse and evaluate in a single call. Prefer [`JsonPath::parse`] plus a
+//! query method when applying the same query to many documents, so the parse and
+//! well-typedness check happen only once.
+//!
+//! ```
+//! use serde_json::json;
+//!
+//! let document = json!({ "a": [1, 2, 3] });
+//! let values = jp_full::query_values("$.a[*]", &document)?;
+//! assert_eq!(values, [&json!(1), &json!(2), &json!(3)]);
+//! # Ok::<(), jp_full::Error>(())
+//! ```
 //!
 //! # Cargo features
 //!
 //! * **`regex`** *(enabled by default)* — provides the `match()` and `search()`
-//!   function extensions, which require an [I-Regexp](https://www.rfc-editor.org/rfc/rfc9485)
-//!   engine. With the feature disabled the crate builds without the [`regex`]
-//!   dependency, and a query that uses those functions fails to compile with a
-//!   clear [`Error`].
+//!   function extensions, which require an [I-Regexp] (RFC 9485) engine backed by the
+//!   [`regex`] crate. With the feature disabled the crate builds without that
+//!   dependency, and a query using those functions is rejected by [`JsonPath::parse`]
+//!   with a clear [`Error`].
+//!
+//! # Conformance
+//!
+//! Correctness is pinned to the official [JSONPath Compliance Test Suite][cts]: every
+//! case is exercised — selected values *and* normalized paths checked in lockstep —
+//! including the queries that must be *rejected* at compile time.
 //!
 //! [RFC 9535]: https://www.rfc-editor.org/rfc/rfc9535
+//! [RFC 9535 §2.7]: https://www.rfc-editor.org/rfc/rfc9535#section-2.7
+//! [I-Regexp]: https://www.rfc-editor.org/rfc/rfc9485
 //! [cts]: https://github.com/jsonpath-standard/jsonpath-compliance-test-suite
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
