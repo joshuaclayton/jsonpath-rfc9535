@@ -97,6 +97,19 @@ const QUERIES: &[(&str, &str)] = &[
         "filter_search",
         r#"$.store.book[?search(@.title, "Number 1")]"#,
     ),
+    // Anchored regex (full match) with a literal pattern — exercises the other
+    // anchoring path; like `filter_search`, the pattern is compilable once.
+    (
+        "filter_match",
+        r#"$.store.book[?match(@.title, "Book Number [0-9]+")]"#,
+    ),
+    // Regex whose pattern is computed from the document (`@.category`), so it cannot be
+    // pre-compiled and must be built per evaluation. Guards that the dynamic-pattern
+    // fallback keeps working and does not regress.
+    (
+        "filter_regex_dynamic",
+        "$.store.book[?search(@.title, @.category)]",
+    ),
     ("descendant_wildcard", "$..*"),
 ];
 

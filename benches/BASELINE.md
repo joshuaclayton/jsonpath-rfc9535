@@ -174,6 +174,38 @@ It helps the **value** path too (skipping the per-leaf `descend` call — `apply
 not. CTS 703/703 (values + normalized paths) still passes. Child/wildcard queries don't
 recurse, so they're unaffected.
 
+### Pre-compiled regex patterns (`match` / `search`) — the big one
+
+`match()`/`search()` recompiled the regex on **every element**: `regex_test` called
+`iregexp::build()` (translate + `Regex::new`) per filter evaluation. Regex *compilation*
+dwarfs matching, so a filter over an N-element array paid N compiles. This is the kind of
+per-element pathology that makes a JSONPath lib "too slow to use" in a rules engine.
+
+A literal pattern (`match(@.x, "constant")`) is now translated and compiled **once** at
+`JsonPath::parse` time, with the call's anchoring baked in, and stored in the IR
+(`compiled::Pattern::Literal(Option<regex::Regex>)`); evaluation only matches. A pattern
+computed from the document (`match(@.x, @.y)`) can't be precompiled and stays
+`Pattern::Dynamic` (compiled per call) — rare, and a ReDoS smell anyway.
+
+A/B (`benches/queries.rs`, eval-only, literal patterns):
+
+| query | 1k before → after | 10k before → after |
+|---|---|---|
+| `?search(@.title, "Number 1")` | 1.56 ms → 27.5 µs (**−98%**) | 16.7 ms → 455 µs (**−97%**) |
+| `?match(@.title, "Book Number [0-9]+")` | 8.81 ms → 37.5 µs (**−99.6%**) | 89.4 ms → 690 µs (**−99.2%**) |
+
+`filter_regex_dynamic` (`?search(@.title, @.category)`, a document-derived pattern) is
+**neutral** — verified against a *warm* baseline at +1.4% (the −8% the cool baseline
+showed was thermal drift; the dynamic path's per-element compile is unchanged). CTS
+703/703 (incl. invalid patterns → false, unicode, and the "regex from the document"
+dynamic case) still passes.
+
+Implementation notes: `Pattern` needs a manual `PartialEq`/`Eq` (compares regex source
+via `Regex::as_str`) since `regex::Regex` isn't `Eq`. The `Function::Match`/`Search`
+variants are now `#[cfg(feature = "regex")]`-gated (they hold a `Pattern`), which as a
+bonus removes the two pre-existing "never constructed" dead-code warnings under
+`--no-default-features`.
+
 ### Known remaining lever (not taken)
 
 A full trail-based deferral (maintain a cheap step-stack during descent, materialise the

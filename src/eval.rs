@@ -508,6 +508,7 @@ fn eval_value_function<'a>(
             [((), value)] => Comparand::Value(Cow::Borrowed(value)),
             _ => Comparand::Nothing,
         },
+        #[cfg(feature = "regex")]
         Function::Match(..) | Function::Search(..) => Comparand::Nothing,
     }
 }
@@ -545,8 +546,8 @@ fn json_number(count: usize) -> Value {
 fn eval_logical_function(function: &Function, current: &Value, root: &Value) -> bool {
     match function {
         Function::Length(..) | Function::Count(..) | Function::Value(..) => false,
-        Function::Match(target, pattern) => regex_test(target, pattern, current, root, true),
-        Function::Search(target, pattern) => regex_test(target, pattern, current, root, false),
+        Function::Match(target, pattern) => regex_test(target, pattern, true, current, root),
+        Function::Search(target, pattern) => regex_test(target, pattern, false, current, root),
     }
 }
 
@@ -560,19 +561,29 @@ const fn eval_logical_function(_function: &Function, _current: &Value, _root: &V
 #[cfg(feature = "regex")]
 fn regex_test(
     target: &ValueArg,
-    pattern: &ValueArg,
+    pattern: &crate::compiled::Pattern,
+    anchored: bool,
     current: &Value,
     root: &Value,
-    anchored: bool,
 ) -> bool {
     let target_value = eval_value_arg(target, current, root);
-    let pattern_value = eval_value_arg(pattern, current, root);
-    let (Some(text), Some(expression)) =
-        (comparand_str(&target_value), comparand_str(&pattern_value))
-    else {
+    let Some(text) = comparand_str(&target_value) else {
         return false;
     };
-    crate::iregexp::build(expression, anchored).is_some_and(|regex| regex.is_match(text))
+    match pattern {
+        // The literal pattern was compiled once at `JsonPath::parse` time (with the
+        // right anchoring); evaluation only matches.
+        crate::compiled::Pattern::Literal(regex) => {
+            regex.as_ref().is_some_and(|regex| regex.is_match(text))
+        }
+        // A document-derived pattern must be compiled now.
+        crate::compiled::Pattern::Dynamic(arg) => {
+            let pattern_value = eval_value_arg(arg, current, root);
+            comparand_str(&pattern_value)
+                .and_then(|expression| crate::iregexp::build(expression, anchored))
+                .is_some_and(|regex| regex.is_match(text))
+        }
+    }
 }
 
 #[cfg(feature = "regex")]

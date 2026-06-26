@@ -111,11 +111,48 @@ pub enum Function {
     Count(FilterQuery),
     /// `value(NodesType) -> ValueType`.
     Value(FilterQuery),
-    /// `match(ValueType, ValueType) -> LogicalType` (anchored regex match).
-    Match(ValueArg, ValueArg),
-    /// `search(ValueType, ValueType) -> LogicalType` (substring regex search).
-    Search(ValueArg, ValueArg),
+    /// `match(ValueType, Pattern) -> LogicalType` (anchored regex match).
+    #[cfg(feature = "regex")]
+    Match(ValueArg, Pattern),
+    /// `search(ValueType, Pattern) -> LogicalType` (substring regex search).
+    #[cfg(feature = "regex")]
+    Search(ValueArg, Pattern),
 }
+
+/// The pattern argument of a `match`/`search` call.
+///
+/// A literal pattern is translated and compiled to a [`regex::Regex`] *once*, here at
+/// compile time, with the call's anchoring (`match` = full, `search` = substring) baked
+/// in — so evaluating the filter over an N-element array no longer recompiles the regex
+/// N times. A pattern computed from the document is necessarily compiled per evaluation.
+#[cfg(feature = "regex")]
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    /// A literal pattern, pre-compiled. `None` if it is not a valid I-Regexp, in which
+    /// case the function always yields false (RFC 9535 §2.4.6).
+    Literal(Option<regex::Regex>),
+    /// A pattern whose value is computed at evaluation time; compiled per call.
+    Dynamic(ValueArg),
+}
+
+// `regex::Regex` is not `PartialEq`/`Eq`; compare patterns by their source so the
+// surrounding IR can keep deriving `Eq`. Two literals are equal iff they compiled from
+// the same (anchored) regex source.
+#[cfg(feature = "regex")]
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Literal(left), Self::Literal(right)) => {
+                left.as_ref().map(regex::Regex::as_str) == right.as_ref().map(regex::Regex::as_str)
+            }
+            (Self::Dynamic(left), Self::Dynamic(right)) => left == right,
+            (Self::Literal(_), Self::Dynamic(_)) | (Self::Dynamic(_), Self::Literal(_)) => false,
+        }
+    }
+}
+
+#[cfg(feature = "regex")]
+impl Eq for Pattern {}
 
 /// An argument occupying a `ValueType` parameter slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +289,29 @@ fn literal_to_value(literal: &ast::Literal) -> Value {
     }
 }
 
+/// Lowers a `match`/`search` pattern argument: a literal string is translated and
+/// compiled once (with `anchored` controlling full-match vs substring); anything else
+/// becomes a [`Pattern::Dynamic`] compiled per evaluation.
+#[cfg(feature = "regex")]
+fn lower_pattern(arg: ast::FunctionArg, anchored: bool) -> Result<Pattern, Error> {
+    match value_arg(arg)? {
+        ValueArg::Literal(value) => Ok(Pattern::Literal(compile_literal(value.as_ref(), anchored))),
+        dynamic @ (ValueArg::Singular(_) | ValueArg::Function(_)) => Ok(Pattern::Dynamic(dynamic)),
+    }
+}
+
+/// Compiles a literal pattern value to a regex, or `None` when it is not a string or not
+/// a valid I-Regexp (both cases make the function always yield false).
+#[cfg(feature = "regex")]
+fn compile_literal(value: &Value, anchored: bool) -> Option<regex::Regex> {
+    match value {
+        Value::String(pattern) => crate::iregexp::build(pattern, anchored),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => {
+            None
+        }
+    }
+}
+
 fn lower_comparison(comparison: ast::Comparison) -> Result<Comparison, Error> {
     Ok(Comparison {
         left: lower_comparable(comparison.left)?,
@@ -296,17 +356,17 @@ fn lower_function(function: ast::FunctionExpr) -> Result<(Function, ResultType),
         }
         #[cfg(feature = "regex")]
         "match" => {
-            let [pattern_target, pattern] = take(&name, args)?;
+            let [target, pattern] = take(&name, args)?;
             Ok((
-                Function::Match(value_arg(pattern_target)?, value_arg(pattern)?),
+                Function::Match(value_arg(target)?, lower_pattern(pattern, true)?),
                 ResultType::Logical,
             ))
         }
         #[cfg(feature = "regex")]
         "search" => {
-            let [pattern_target, pattern] = take(&name, args)?;
+            let [target, pattern] = take(&name, args)?;
             Ok((
-                Function::Search(value_arg(pattern_target)?, value_arg(pattern)?),
+                Function::Search(value_arg(target)?, lower_pattern(pattern, false)?),
                 ResultType::Logical,
             ))
         }
