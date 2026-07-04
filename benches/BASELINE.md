@@ -1,6 +1,6 @@
 # Performance baseline
 
-The committed "where we started" snapshot, captured **before** any evaluation-path optimisation. After changes, compare with `just bench -- --baseline main` / `just bench-compare -- --baseline main` (criterion's own baseline lives in the gitignored `.criterion/`). Numbers are machine-specific — treat the *ratios*, not the absolutes, as the signal.
+The committed baseline snapshot, captured **before** any evaluation-path optimisation. After changes, compare with `just bench -- --baseline main` / `just bench-compare -- --baseline main` (criterion's own baseline lives in the gitignored `.criterion/`). Numbers are machine-specific; compare ratios, not absolute times.
 
 ## Context
 
@@ -79,15 +79,15 @@ The committed "where we started" snapshot, captured **before** any evaluation-pa
 
 jsonpath-rfc9535 is **4–11× slower than jsonpath_lib** on wildcard/descendant queries, ≈1.2× on a single-node lookup, and **~2× faster** on the comparison filter. The gap scales with the number of nodes *visited*.
 
-**Root cause (confirmed in `src/eval.rs`):** every traversal step allocates a `NormalizedPath` link (`Rc::new(Link)` via `child_name`/`child_index`) for each node visited — `collect_descendants` does this for the whole tree on `$..`, `apply_wildcard` for every child — and `query_values()` builds the full path-bearing `NodeList` then discards the paths. jsonpath_lib collects only `&Value`, with no per-node allocation. `search()` is ~on par with jsonpath-rust (regex dominates).
+**Root cause (`src/eval.rs`):** every traversal step allocates a `NormalizedPath` link (`Rc::new(Link)` via `child_name`/`child_index`) for each node visited — `collect_descendants` does this for the whole tree on `$..`, `apply_wildcard` for every child — and `query_values()` builds the full path-bearing `NodeList` then discards the paths. jsonpath_lib collects only `&Value`, with no per-node allocation. `search()` is ~on par with jsonpath-rust (regex dominates).
 
 ---
 
 ## Update 2026-06-26 — singular fast path + rsonpath reference
 
-The "Finding" above is the **original cold pre-optimisation snapshot**. Since then the path-free value path, streaming traversal, inlining, `$..name` specialisation, and buffer presizing landed (commits up to `ffab473`), making jsonpath-rfc9535 faster-or-equal to jsonpath_lib on every case. This update adds the **singular fast path** and a third comparison engine.
+The "Finding" above is the **original cold pre-optimisation snapshot**. Since then the path-free value path, streaming traversal, inlining, `$..name` specialisation, and buffer presizing landed (commits up to `ffab473`), making jsonpath-rfc9535 at least as fast as jsonpath_lib on every case. This update adds the singular fast path and a third comparison engine.
 
-### Singular fast path (this change)
+### Singular fast path
 
 A query whose every segment is a single child name/index step (`$.a.b[0].c`) selects at most one node, so it needs no worklist and no per-segment `Vec`. `JsonPath` precomputes this form (`compiled::Query::singular`) and threads a single `&Value` down the document — eliminating ~5 small heap allocations per call. The general worklist path is left byte-for-byte unchanged (dispatch lives in `JsonPath::query`/`query_values`), so non-singular queries are algorithmically untouched.
 
@@ -97,7 +97,7 @@ Headline effect (eval-only, jsonpath-rfc9535 vs jsonpath_lib, Apple M4 Pro, warm
 |---|---|---|---|---|---|
 | 10k | child | 75 ns | **37 ns** (−51%) | 228 ns | **6.1× faster** (was ~3×) |
 
-`query/child/*` in `benches/queries.rs` shows the same −52% at every document size (the lookup is size-independent). Other shapes (`wildcard`, `descendant`, filters) move only within the ±5–10% layout/thermal noise floor at these scales — verified by opposite-sign deltas for the same query across harnesses/runs — i.e. no real regression.
+`query/child/*` in `benches/queries.rs` shows the same −52% at every document size (the lookup is size-independent). Other shapes (`wildcard`, `descendant`, filters) move only within the ±5–10% layout/thermal noise floor at these scales — verified by opposite-sign deltas for the same query across harnesses/runs (noise, not a regression).
 
 ### rsonpath in the comparison bench (`scan/` group)
 
@@ -108,7 +108,7 @@ Headline effect (eval-only, jsonpath-rfc9535 vs jsonpath_lib, Apple M4 Pro, warm
 | child | 10.8 ms | 10.9 ms | **435 µs** |
 | author_wildcard | 10.9 ms | 11.4 ms | **910 µs** |
 
-The DOM engines spend ~10.7 ms building a `Value` from the 2 MB document; the query itself is microseconds. rsonpath is ~12–25× faster here **only because it skips DOM construction** — the cost a `Value`-based engine pays up front and a byte engine never does. This is the honest framing: when you already hold a `Value` (parse once, query many — the `eval/` group), jsonpath-rfc9535 is the fast one; when you have raw text and scan once, a byte engine wins. The transferable byte-engine techniques (query→automaton, subtree pruning, allocation discipline) are already applied in `eval.rs`; SIMD structural classification does not apply to a materialised DOM.
+The DOM engines spend ~10.7 ms building a `Value` from the 2 MB document; the query itself is microseconds. rsonpath is ~12–25× faster here **only because it skips DOM construction** — the cost a `Value`-based engine pays up front and a byte engine never does. When you already hold a `Value` (parse once, query many — the `eval/` group), jsonpath-rfc9535 is faster; when you have raw text and scan once, a byte engine wins. The transferable byte-engine techniques (query→automaton, subtree pruning, allocation discipline) are already applied in `eval.rs`; SIMD structural classification does not apply to a materialised DOM.
 
 ### New measurement tooling
 
@@ -151,16 +151,15 @@ render identically.
 
 API note: `NormalizedPath` gaining a lifetime is a breaking change (a path can no longer
 outlive the document it locates into — neither could a `NodeList`, which already borrows
-the selected values). Acceptable at 0.1.0 / pre-publication.
+the selected values). Made before 1.0.
 
-### Pruned descendant recursion (lazy paths, the cheap form)
+### Pruned descendant recursion
 
 Descendant traversal (`descend`/`descend_name`) recursed into *every* member/element,
 building a path step (`Rc<Link>` for the paths API) to do so — but a scalar has no
 descendants, so recursing into it can never select anything. Guarding the recursion on
 `is_container` (object/array) skips that dead-end work: no path step is built to descend
-into a leaf. This is the cheap, low-risk form of "lazy" path construction — don't build a
-path you'll throw away — and it captured more than a full trail-based deferral would have:
+into a leaf. This captures more than a full trail-based deferral would have:
 
 | micro @10k | before | after | change |
 |---|---|---|---|
@@ -169,23 +168,23 @@ path you'll throw away — and it captured more than a full trail-based deferral
 | `$..*` values | ~790 µs | ~535 µs | **−32%** |
 | `$..price` values | ~665 µs | ~635 µs | −4% |
 
-It helps the **value** path too (skipping the per-leaf `descend` call — `apply_selector`
-+ match — that always selected nothing), which a deferred-materialisation rewrite would
+It also benefits the value path — skipping the per-leaf `descend` call (`apply_selector`
++ match) that always selected nothing, which a deferred-materialisation rewrite would
 not. CTS 703/703 (values + normalized paths) still passes. Child/wildcard queries don't
 recurse, so they're unaffected.
 
-### Pre-compiled regex patterns (`match` / `search`) — the big one
+### Pre-compiled regex patterns (`match` / `search`)
 
 `match()`/`search()` recompiled the regex on **every element**: `regex_test` called
 `iregexp::build()` (translate + `Regex::new`) per filter evaluation. Regex *compilation*
-dwarfs matching, so a filter over an N-element array paid N compiles. This is the kind of
-per-element pathology that makes a JSONPath lib "too slow to use" in a rules engine.
+dwarfs matching, so a filter over an N-element array paid N compilations — impractically
+slow over large arrays.
 
 A literal pattern (`match(@.x, "constant")`) is now translated and compiled **once** at
 `JsonPath::parse` time, with the call's anchoring baked in, and stored in the IR
 (`compiled::Pattern::Literal(Option<regex::Regex>)`); evaluation only matches. A pattern
 computed from the document (`match(@.x, @.y)`) can't be precompiled and stays
-`Pattern::Dynamic` (compiled per call) — rare, and a ReDoS smell anyway.
+`Pattern::Dynamic` (compiled per call) — uncommon, and a ReDoS risk regardless.
 
 A/B (`benches/queries.rs`, eval-only, literal patterns):
 
@@ -206,12 +205,12 @@ variants are now `#[cfg(feature = "regex")]`-gated (they hold a `Pattern`), whic
 bonus removes the two pre-existing "never constructed" dead-code warnings under
 `--no-default-features`.
 
-### Known remaining lever (not taken)
+### Remaining optimisation (not pursued)
 
 A full trail-based deferral (maintain a cheap step-stack during descent, materialise the
 `NormalizedPath` only at a selected node) would additionally avoid the `Rc<Link>` for
 *container* subtrees that contain no match (e.g. a `reviews` array under `$..price`). With
 the `is_container` prune already taking −56% off `$..price` paths, the remaining headroom
 is ~10–20% on that one query shape, at the cost of a new `Trail` trait + associated type
-and loss of prefix-sharing across matches — not worth it at this point.
+and loss of prefix-sharing across matches; not pursued.
 

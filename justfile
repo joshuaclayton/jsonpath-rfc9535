@@ -1,4 +1,4 @@
-# Default: the pre-merge gate — run `just ci`
+# Default: run every check (`just ci`)
 default: ci
 
 # Auto-fix lints and formatting (clippy --fix, then rustfmt)
@@ -70,7 +70,7 @@ bench *ARGS: bench-fixtures
 bench-compare *ARGS: bench-fixtures
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --features compare --bench comparison {{ ARGS }}
 
-# Save the current numbers as the `main` baseline (the "where we started" reference).
+# Save the current numbers as the `main` baseline for future comparisons.
 [group('bench')]
 bench-save-baseline: bench-fixtures
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --bench queries -- --save-baseline main
@@ -137,7 +137,7 @@ test-toml: setup-toml
 test-audit: setup-audit
   cargo audit
 
-# Everything green & ready to merge — the full CI gate (coverage is separate: `just coverage`)
+# Run every check CI runs; if this passes, it's ready to merge (coverage is separate: `just coverage`)
 [group('test')]
 ci: test-audit test-fmt test-lint test-lint-no-default test test-no-default test-doc test-doc-links test-doc-cfg test-toml
 

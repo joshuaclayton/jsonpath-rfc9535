@@ -10,7 +10,7 @@
 //! cargo bench --features compare --bench comparison
 //! ```
 //!
-//! Three groups, measuring three different things:
+//! Four groups, measuring four different things:
 //!
 //! * **`eval/*` (headline)** — jsonpath-rfc9535 vs `jsonpath_lib`, each query *pre-compiled once*
 //!   over a *pre-parsed* [`Value`], only evaluation timed. This is the realistic
@@ -25,6 +25,13 @@
 //!   `Value`-based engine pays and a byte engine skips. `rsonpath` also returns a count /
 //!   byte spans, not borrowed `&Value`s, and supports no filter expressions — so `scan/`
 //!   covers only the non-filter cases and uses `rsonpath`'s cheapest `count` mode.
+//! * **`extract/*`** — the same **text → results** pipeline, but every engine ends at
+//!   *usable, materialised values*. The DOM engines parse and return `Vec<&Value>`;
+//!   `rsonpath` scans the bytes, copies out each matched node's JSON text, and we parse
+//!   every fragment back into an owned `Value`. Where `scan/` lets `rsonpath` stop at a
+//!   bare count, this makes both paradigms pay to produce results you can actually read —
+//!   the fairest cross-paradigm unit of work. `rsonpath` still skips the whole-document
+//!   DOM, so it stays ahead, just by a smaller and more honest margin.
 //!
 //! Each case asserts that the engines select the *same number of nodes* before benching,
 //! so a non-equivalent query fails loudly rather than comparing apples to oranges.
@@ -34,6 +41,7 @@ use jsonpath_rfc9535::JsonPath as JpFull;
 use jsonpath_rust::JsonPath as _;
 use rsonpath::engine::{Compiler, Engine, RsonpathEngine};
 use rsonpath::input::BorrowedBytes;
+use rsonpath::result::Match;
 use serde_json::Value;
 use std::hint::black_box;
 use std::path::Path;
@@ -136,6 +144,20 @@ fn rsonpath_engine(query: &str) -> Option<RsonpathEngine> {
 
 fn count_rsonpath(engine: &RsonpathEngine, text: &str) -> Option<u64> {
     engine.count(&BorrowedBytes::new(text.as_bytes())).ok()
+}
+
+/// Extract-and-use: `rsonpath` materialises each matched node's JSON text, then we parse
+/// every fragment back into an owned `Value`. This is the fair counterpart to a DOM
+/// engine's `Vec<&Value>` — both sides end at values you can actually read, rather than
+/// letting `rsonpath` stop at a bare `count`. `None` if the scan or any fragment-parse fails.
+fn extract_rsonpath(engine: &RsonpathEngine, text: &str) -> Option<Vec<Value>> {
+    let mut sink: Vec<Match> = Vec::new();
+    engine
+        .matches(&BorrowedBytes::new(text.as_bytes()), &mut sink)
+        .ok()?;
+    sink.into_iter()
+        .map(|m| serde_json::from_slice::<Value>(m.bytes()).ok())
+        .collect()
 }
 
 /// Fails the bench run if the engines do not select the same number of nodes
@@ -274,5 +296,67 @@ fn bench_scan(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_eval, bench_end_to_end, bench_scan);
+/// **Extract-and-use** variant of `scan/`: every engine ends at usable, materialised
+/// values, so both paradigms pay for producing results you can read. The DOM engines parse
+/// the text and return `Vec<&Value>`; `rsonpath` scans the bytes, copies out each matched
+/// node's JSON text, and we parse every fragment back into an owned `Value`. `rsonpath`
+/// still skips building a whole-document DOM, so it is expected to stay ahead — just by a
+/// smaller, more honest margin than `scan/`, which lets it stop at a bare count.
+fn bench_extract(c: &mut Criterion) {
+    for (size, text) in fixture_texts() {
+        let Ok(document) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        for case in CASES {
+            let Some(query) = case.rsonpath else {
+                continue;
+            };
+            let Some(engine) = rsonpath_engine(query) else {
+                continue;
+            };
+            // Cross-check the extracted match count against jsonpath-rfc9535 before benching.
+            if let Some(values) = extract_rsonpath(&engine, &text) {
+                let jp = count_jsonpath_rfc9535(&document, case.rfc);
+                assert_eq!(
+                    jp,
+                    values.len(),
+                    "jsonpath-rfc9535 vs rsonpath disagree on `{}` over {size}: {jp} vs {} nodes",
+                    case.label,
+                    values.len()
+                );
+            }
+
+            let mut group = c.benchmark_group(format!("extract/{size}/{}", case.label));
+            if let Ok(compiled) = JpFull::parse(case.rfc) {
+                group.bench_function("jsonpath-rfc9535 (parse+query)", |b| {
+                    b.iter(|| {
+                        serde_json::from_str::<Value>(black_box(&text))
+                            .map_or(0, |document| compiled.query_values(&document).len())
+                    });
+                });
+            }
+            if let Some(goessner) = case.goessner {
+                group.bench_function("jsonpath_lib (parse+query)", |b| {
+                    b.iter(|| {
+                        serde_json::from_str::<Value>(black_box(&text)).map_or(0, |document| {
+                            jsonpath_lib::select(&document, goessner).map_or(0, |n| n.len())
+                        })
+                    });
+                });
+            }
+            group.bench_function("rsonpath (matches+parse)", |b| {
+                b.iter(|| extract_rsonpath(&engine, black_box(&text)));
+            });
+            group.finish();
+        }
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_eval,
+    bench_end_to_end,
+    bench_scan,
+    bench_extract
+);
 criterion_main!(benches);

@@ -16,8 +16,8 @@
 //! ```
 //!
 //! Implementation notes:
-//! * `int` forbids leading zeros, a bare `-`, and a leading `+`. Note that `int`
-//!   itself matches *only* `"0"` from an input like `"01"` (leaving `"1"`); the
+//! * `int` forbids leading zeros, a bare `-`, and a leading `+`. `int` itself
+//!   matches *only* `"0"` from an input like `"01"` (leaving `"1"`); the
 //!   leading-zero query `$[01]` is rejected because the surrounding bracket is parsed
 //!   with `all_consuming`, not because `int` errors.
 //! * A valid integer that overflows `i64`, or one within `i64` but outside the

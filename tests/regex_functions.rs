@@ -45,7 +45,7 @@ mod with_regex {
     fn invalid_literal_pattern_yields_false_not_an_error() {
         // RFC 9535 §2.4.6: a pattern that is not a valid I-Regexp makes the function
         // return `false`. The query still compiles — `(` is an unbalanced group — it
-        // simply selects nothing.
+        // selects nothing.
         let document = json!([{ "a": "anything" }]);
         let query = JsonPath::parse(r#"$[?match(@.a, "(")]"#)
             .expect("an invalid pattern must not fail compilation");
