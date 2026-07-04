@@ -15,28 +15,28 @@ The committed "where we started" snapshot, captured **before** any evaluation-pa
 | Sampling | quick run: sample-size 20, warm-up 0.4s, measure 1.2s (a full `just bench-save-baseline` uses criterion defaults) |
 | Fixtures | benches/data/bookstore-1k.json, bookstore-10k.json |
 
-## Headline: eval-only (compile once, query many) — jp-full vs jsonpath_lib
+## Headline: eval-only (compile once, query many) — jsonpath-rfc9535 vs jsonpath_lib
 
-**Goal: jp-full ≤ jsonpath_lib on every case.** Not met for traversal-heavy queries.
+**Goal: jsonpath-rfc9535 ≤ jsonpath_lib on every case.** Not met for traversal-heavy queries.
 
-| size | case | jp-full | jsonpath_lib | result |
+| size | case | jsonpath-rfc9535 | jsonpath_lib | result |
 |---|---|---|---|---|
 | 1k | child | 262.20 ns | 222.01 ns | 1.2× slower |
 | 1k | author_wildcard | 74.31 µs | 12.58 µs | 5.9× slower |
 | 1k | descendant_price | 674.19 µs | 58.65 µs | 11.5× slower |
 | 1k | nested_wildcard | 233.64 µs | 36.27 µs | 6.4× slower |
 | 1k | filter_cheap | 24.97 µs | 57.64 µs | 2.3× faster |
-| 1k | filter_search | 1.67 ms | — | jp-full only (no Goessner regex) |
+| 1k | filter_search | 1.67 ms | — | jsonpath-rfc9535 only (no Goessner regex) |
 | 10k | child | 263.68 ns | 222.25 ns | 1.2× slower |
 | 10k | author_wildcard | 912.81 µs | 193.22 µs | 4.7× slower |
 | 10k | descendant_price | 7.22 ms | 719.70 µs | 10.0× slower |
 | 10k | nested_wildcard | 3.13 ms | 513.39 µs | 6.1× slower |
 | 10k | filter_cheap | 321.30 µs | 690.45 µs | 2.1× faster |
-| 10k | filter_search | 18.62 ms | — | jp-full only (no Goessner regex) |
+| 10k | filter_search | 18.62 ms | — | jsonpath-rfc9535 only (no Goessner regex) |
 
 ## End-to-end (parse + evaluate per call) — all three engines
 
-| size | case | jp-full | jsonpath_lib | jsonpath-rust |
+| size | case | jsonpath-rfc9535 | jsonpath_lib | jsonpath-rust |
 |---|---|---|---|---|
 | 1k | child | 745.81 ns | 677.35 ns | 2.88 µs |
 | 1k | author_wildcard | 76.12 µs | 13.29 µs | 185.99 µs |
@@ -51,7 +51,7 @@ The committed "where we started" snapshot, captured **before** any evaluation-pa
 | 10k | filter_cheap | 328.09 µs | 696.27 µs | 1.35 ms |
 | 10k | filter_search | 18.78 ms | — | 19.71 ms |
 
-## jp-full scaling (benches/queries.rs) — evaluation only
+## jsonpath-rfc9535 scaling (benches/queries.rs) — evaluation only
 
 | query | small | 1k | 10k |
 |---|---|---|---|
@@ -77,7 +77,7 @@ The committed "where we started" snapshot, captured **before** any evaluation-pa
 
 ## Finding
 
-jp-full is **4–11× slower than jsonpath_lib** on wildcard/descendant queries, ≈1.2× on a single-node lookup, and **~2× faster** on the comparison filter. The gap scales with the number of nodes *visited*.
+jsonpath-rfc9535 is **4–11× slower than jsonpath_lib** on wildcard/descendant queries, ≈1.2× on a single-node lookup, and **~2× faster** on the comparison filter. The gap scales with the number of nodes *visited*.
 
 **Root cause (confirmed in `src/eval.rs`):** every traversal step allocates a `NormalizedPath` link (`Rc::new(Link)` via `child_name`/`child_index`) for each node visited — `collect_descendants` does this for the whole tree on `$..`, `apply_wildcard` for every child — and `query_values()` builds the full path-bearing `NodeList` then discards the paths. jsonpath_lib collects only `&Value`, with no per-node allocation. `search()` is ~on par with jsonpath-rust (regex dominates).
 
@@ -85,15 +85,15 @@ jp-full is **4–11× slower than jsonpath_lib** on wildcard/descendant queries,
 
 ## Update 2026-06-26 — singular fast path + rsonpath reference
 
-The "Finding" above is the **original cold pre-optimisation snapshot**. Since then the path-free value path, streaming traversal, inlining, `$..name` specialisation, and buffer presizing landed (commits up to `ffab473`), making jp-full faster-or-equal to jsonpath_lib on every case. This update adds the **singular fast path** and a third comparison engine.
+The "Finding" above is the **original cold pre-optimisation snapshot**. Since then the path-free value path, streaming traversal, inlining, `$..name` specialisation, and buffer presizing landed (commits up to `ffab473`), making jsonpath-rfc9535 faster-or-equal to jsonpath_lib on every case. This update adds the **singular fast path** and a third comparison engine.
 
 ### Singular fast path (this change)
 
 A query whose every segment is a single child name/index step (`$.a.b[0].c`) selects at most one node, so it needs no worklist and no per-segment `Vec`. `JsonPath` precomputes this form (`compiled::Query::singular`) and threads a single `&Value` down the document — eliminating ~5 small heap allocations per call. The general worklist path is left byte-for-byte unchanged (dispatch lives in `JsonPath::query`/`query_values`), so non-singular queries are algorithmically untouched.
 
-Headline effect (eval-only, jp-full vs jsonpath_lib, Apple M4 Pro, warm):
+Headline effect (eval-only, jsonpath-rfc9535 vs jsonpath_lib, Apple M4 Pro, warm):
 
-| size | case | jp-full before | jp-full after | jsonpath_lib | after vs jsonpath_lib |
+| size | case | jsonpath-rfc9535 before | jsonpath-rfc9535 after | jsonpath_lib | after vs jsonpath_lib |
 |---|---|---|---|---|---|
 | 10k | child | 75 ns | **37 ns** (−51%) | 228 ns | **6.1× faster** (was ~3×) |
 
@@ -103,12 +103,12 @@ Headline effect (eval-only, jp-full vs jsonpath_lib, Apple M4 Pro, warm):
 
 `rsonpath` (0.10) is a raw-bytes + SIMD engine: it never builds a `serde_json::Value`. It can't share the `eval/` group (which times a *pre-parsed* DOM), so the new `scan/*` group times the full **text → matches** pipeline — `serde_json::from_str` + query for the DOM engines, a byte `count` for rsonpath. It covers only the non-filter cases (rsonpath has no filter support) and asserts node-count equivalence before benching.
 
-| scan/10k (text → matches) | jp-full (parse+query) | jsonpath_lib | rsonpath (count) |
+| scan/10k (text → matches) | jsonpath-rfc9535 (parse+query) | jsonpath_lib | rsonpath (count) |
 |---|---|---|---|
 | child | 10.8 ms | 10.9 ms | **435 µs** |
 | author_wildcard | 10.9 ms | 11.4 ms | **910 µs** |
 
-The DOM engines spend ~10.7 ms building a `Value` from the 2 MB document; the query itself is microseconds. rsonpath is ~12–25× faster here **only because it skips DOM construction** — the cost a `Value`-based engine pays up front and a byte engine never does. This is the honest framing: when you already hold a `Value` (parse once, query many — the `eval/` group), jp-full is the fast one; when you have raw text and scan once, a byte engine wins. The transferable byte-engine techniques (query→automaton, subtree pruning, allocation discipline) are already applied in `eval.rs`; SIMD structural classification does not apply to a materialised DOM.
+The DOM engines spend ~10.7 ms building a `Value` from the 2 MB document; the query itself is microseconds. rsonpath is ~12–25× faster here **only because it skips DOM construction** — the cost a `Value`-based engine pays up front and a byte engine never does. This is the honest framing: when you already hold a `Value` (parse once, query many — the `eval/` group), jsonpath-rfc9535 is the fast one; when you have raw text and scan once, a byte engine wins. The transferable byte-engine techniques (query→automaton, subtree pruning, allocation discipline) are already applied in `eval.rs`; SIMD structural classification does not apply to a materialised DOM.
 
 ### New measurement tooling
 

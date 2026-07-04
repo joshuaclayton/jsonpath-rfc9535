@@ -1,9 +1,9 @@
-# jp-full
+# jsonpath-rfc9535
 
-A complete, [RFC 9535](https://www.rfc-editor.org/rfc/rfc9535) compliant JSONPath
-query engine for [`serde_json`](https://docs.rs/serde_json) values.
+A complete [RFC 9535](https://www.rfc-editor.org/rfc/rfc9535) JSONPath query engine for
+[`serde_json`](https://docs.rs/serde_json) values.
 
-JSONPath selects a set of nodes — the *nodelist* — from a JSON document. `jp-full`
+JSONPath selects a set of nodes — the *nodelist* — from a JSON document. `jsonpath-rfc9535`
 parses and type-checks a query string once and evaluates it against any number of
 documents, returning the selected values and, on request, their **normalized paths**.
 
@@ -13,7 +13,7 @@ documents, returning the selected values and, on request, their **normalized pat
   child and descendant segments; nested filter expressions.
 - **Compile-time validation** — `JsonPath::parse` parses *and* runs the RFC 9535
   §2.4 function well-typedness check, so a compiled query is guaranteed valid and
-  well-typed. Malformed or ill-typed queries are rejected up front with a clear error.
+  well-typed. Malformed or ill-typed queries are rejected at parse time, not at evaluation.
 - **Normalized paths** — every selected node carries its canonical location
   (`$['store']['book'][0]`) per RFC 9535 §2.7.
 - **Function extensions** — `length()`, `count()`, `value()`, plus `match()` and
@@ -23,13 +23,13 @@ documents, returning the selected values and, on request, their **normalized pat
 
 ```toml
 [dependencies]
-jp-full = "0.1"
+jsonpath-rfc9535 = "0.1"
 ```
 
 ## Usage
 
 ```rust
-use jp_full::JsonPath;
+use jsonpath_rfc9535::JsonPath;
 use serde_json::json;
 
 let document = json!({
@@ -62,13 +62,39 @@ construction entirely — appreciably faster for wildcard- and descendant-heavy 
 
 ```rust
 let document = serde_json::json!({ "a": [1, 2, 3] });
-let query = jp_full::JsonPath::parse("$.a[*]").expect("valid query");
+let query = jsonpath_rfc9535::JsonPath::parse("$.a[*]").expect("valid query");
 let values = query.query_values(&document);
 assert_eq!(values.len(), 3);
 ```
 
-For a one-off query, the top-level `jp_full::query` / `jp_full::query_values` functions
+For a one-off query, the top-level `jsonpath_rfc9535::query` / `jsonpath_rfc9535::query_values` functions
 compile and evaluate in a single call.
+
+### Regex functions
+
+With the default `regex` feature, filters may use `match()` (whole string, anchored) and
+`search()` (substring), per I-Regexp:
+
+```rust
+let users = serde_json::json!([{ "name": "Ada" }, { "name": "linus" }]);
+let capitalized =
+    jsonpath_rfc9535::query_values(r#"$[?match(@.name, "[A-Z].*")]"#, &users)
+        .expect("valid query");
+assert_eq!(capitalized, [&serde_json::json!({ "name": "Ada" })]);
+```
+
+### Validating a query
+
+`JsonPath::parse` rejects a malformed or ill-typed query, so it validates a query without
+running it:
+
+```rust
+use jsonpath_rfc9535::JsonPath;
+
+assert!(JsonPath::parse("$.store.book[0]").is_ok()); // valid
+assert!(JsonPath::parse("$.store.book[").is_err()); // unclosed bracket
+assert!(JsonPath::parse("$[?length(@.*) < 3]").is_err()); // ill-typed argument
+```
 
 ## Performance
 
@@ -83,14 +109,14 @@ for the micro-benchmarks and cross-library comparisons (`just bench`, `just benc
 The surface is deliberately small: `JsonPath`, the `query` / `query_values` free
 functions, and the result types `NodeList`, `LocatedNode`, and `NormalizedPath` (plus
 `Error`). The grammar AST, the compiled IR, the parser, and the evaluator are private
-implementation details — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+implementation details.
 
 ## Cargo features
 
 - **`regex`** *(enabled by default)* — provides the `match()` and `search()` function
   extensions, backed by an I-Regexp engine. With the feature disabled the crate builds
   without the [`regex`](https://docs.rs/regex) dependency, and a query that uses those
-  functions fails to compile with a clear error.
+  functions is rejected by `JsonPath::parse`.
 
 ## Conformance
 
@@ -99,6 +125,19 @@ Correctness is pinned to the official
 the engine is exercised against every case — both the expected nodelists (values and
 normalized paths, checked in lockstep) and the cases that must be *rejected* at compile
 time.
+
+## Development
+
+This repo uses [`just`](https://github.com/casey/just) as its task runner; `just --list`
+shows every recipe, grouped. Install the dev tooling once with `just setup`, then:
+
+| Command | Purpose |
+|---|---|
+| `just ci` | **The pre-merge gate** — runs exactly what CI runs: fmt, clippy (both feature sets), the test suite (both feature sets), doc tests, doc generation + link check (incl. a docs.rs-style nightly build), audit, and toml. Green here means it's ready to merge. |
+| `just test` | Run just the test suite. |
+| `just docs` | Build the API docs and open them in a browser. |
+| `just coverage` | Generate the HTML coverage report and open it. |
+| `just bench` | Run the criterion benchmarks (add `-- --baseline main` to compare against a saved baseline). |
 
 ## License
 

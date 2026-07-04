@@ -4,7 +4,7 @@
 //! bracket form defined by [RFC 9535 §2.7] (`$['a'][3]`). During evaluation the
 //! engine threads a path alongside each node and extends it as it descends; because
 //! the path is stored as a shared parent-chain ([`Rc`]), extending it is O(1) and no
-//! string is built until [`Display`](fmt::Display) is actually invoked.
+//! string is built until [`Display`](fmt::Display) is invoked.
 //!
 //! [RFC 9535 §2.7]: https://www.rfc-editor.org/rfc/rfc9535#section-2.7
 

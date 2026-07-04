@@ -1,5 +1,5 @@
 //! Property-based tests (proptest) for invariants that must hold across *all* inputs,
-//! complementing the example-driven CTS harness in `cts.rs`.
+//! complementing the example-driven compliance harness in `compliance_test_suite.rs`.
 //!
 //! Three properties:
 //! * **parse never panics** — `JsonPath::parse` returns `Ok`/`Err` for any input,
@@ -10,7 +10,7 @@
 //! * **a normalized path re-selects its own node** — re-querying the document with a
 //!   node's path yields exactly that node, with the same value.
 
-use jp_full::JsonPath;
+use jsonpath_rfc9535::JsonPath;
 use proptest::prelude::*;
 use serde_json::Value;
 

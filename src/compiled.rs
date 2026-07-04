@@ -15,6 +15,9 @@
 //! [`QueryRoot`](crate::ast::QueryRoot), [`SingularQuery`](crate::ast::SingularQuery))
 //! are reused from [`crate::ast`] directly.
 //!
+//! Keeping the IR separate from the AST means the well-typedness check runs once, here in
+//! [`lower`] — the evaluator only ever operates on a query already proven valid.
+//!
 //! [RFC 9535 §2.4.3]: https://www.rfc-editor.org/rfc/rfc9535#section-2.4.3
 
 use crate::ast;
@@ -58,7 +61,9 @@ pub enum LogicalExpr {
     Comparison(Comparison),
     /// A bare query used as an existence test.
     Existence(ExistenceTest),
-    /// A `LogicalType` function used as a test (`match`/`search`).
+    /// A `LogicalType` function used as a test (`match`/`search`). Only `match`/`search`
+    /// return `LogicalType`, so this exists only when the `regex` feature is enabled.
+    #[cfg(feature = "regex")]
     Test(Function),
 }
 
@@ -170,6 +175,7 @@ pub enum ValueArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResultType {
     Value,
+    #[cfg(feature = "regex")]
     Logical,
 }
 
@@ -265,15 +271,16 @@ fn lower_logical(expr: ast::LogicalExpr) -> Result<LogicalExpr, Error> {
             };
             Ok(LogicalExpr::Existence(test))
         }
-        ast::LogicalExpr::FunctionTest(function) => {
-            let (function, result) = lower_function(function)?;
-            match result {
-                ResultType::Logical => Ok(LogicalExpr::Test(function)),
-                ResultType::Value => Err(Error::IllTyped {
-                    message: "a ValueType function result cannot be used as a bare test".to_owned(),
-                }),
-            }
-        }
+        ast::LogicalExpr::FunctionTest(function) => match lower_function(function)? {
+            #[cfg(feature = "regex")]
+            (function, ResultType::Logical) => Ok(LogicalExpr::Test(function)),
+            // Without `regex`, every function returns `ValueType`, so a bare function
+            // test is always ill-typed. `lower_function` still ran, so arity/unknown-name
+            // errors have already been propagated above.
+            (_function, ResultType::Value) => Err(Error::IllTyped {
+                message: "a ValueType function result cannot be used as a bare test".to_owned(),
+            }),
+        },
     }
 }
 
@@ -330,6 +337,7 @@ fn lower_comparable(comparable: ast::Comparable) -> Result<Comparable, Error> {
             let (function, result) = lower_function(function)?;
             match result {
                 ResultType::Value => Ok(Comparable::Function(function)),
+                #[cfg(feature = "regex")]
                 ResultType::Logical => Err(Error::IllTyped {
                     message: "a LogicalType function result cannot be used in a comparison"
                         .to_owned(),
@@ -415,6 +423,7 @@ fn value_arg(arg: ast::FunctionArg) -> Result<ValueArg, Error> {
             let (function, result) = lower_function(function)?;
             match result {
                 ResultType::Value => Ok(ValueArg::Function(Box::new(function))),
+                #[cfg(feature = "regex")]
                 ResultType::Logical => Err(Error::IllTyped {
                     message: "a LogicalType function result cannot be used where a ValueType is \
                               expected"

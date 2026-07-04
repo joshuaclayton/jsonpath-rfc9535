@@ -8,7 +8,7 @@
 //! # Layout / conventions
 //!
 //! * Each grammar rule has a corresponding combinator, grouped by topic into the
-//!   submodules ([`string`], [`number`], [`selector`], [`slice`], [`segment`],
+//!   submodules ([`string`], [`number`], [`selector`], [`mod@slice`], [`segment`],
 //!   [`filter`], [`function`], [`query`]). Every combinator is annotated with the
 //!   verbatim ABNF rule it implements.
 //! * Combinators take `&str` and return [`nom::IResult`] over `&str`, e.g.
@@ -21,10 +21,6 @@
 //!   [`JsonInt`](crate::ast::JsonInt) via [`JsonInt::new`](crate::ast::JsonInt::new),
 //!   which rejects values outside the I-JSON safe range. In a combinator, the
 //!   idiomatic way is `nom::combinator::map_res(int_i64, JsonInt::new)`.
-//!
-//! Every combinator below is a **stub** that fails to parse (see [`pending`]); the
-//! matching tests are `#[ignore]`d and document the intended behavior. Implement the
-//! combinator bodies and remove the `#[ignore]` as each rule comes online.
 //!
 //! [RFC 9535 Appendix A]: https://www.rfc-editor.org/rfc/rfc9535#appendix-A
 
@@ -49,9 +45,8 @@ pub mod string;
 /// # Errors
 ///
 /// Returns [`Error::Syntax`] (with the byte offset at which parsing failed) if the
-/// string is not a grammatically valid JSONPath query. Integer values outside the
-/// I-JSON safe range surface as [`Error::IntegerOutOfRange`] once the relevant
-/// combinators are implemented with [`JsonInt::new`](crate::ast::JsonInt::new).
+/// string is not a grammatically valid JSONPath query, or [`Error::IntegerOutOfRange`]
+/// if an array index or slice bound lies outside the I-JSON safe range.
 pub fn parse(input: &str) -> Result<Query, Error> {
     match all_consuming(query::query).parse(input) {
         Ok((_rest, query)) => Ok(query),

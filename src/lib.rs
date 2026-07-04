@@ -1,4 +1,4 @@
-//! `jp-full` — a complete, [RFC 9535] compliant JSONPath query engine for
+//! `jsonpath-rfc9535` — a complete [RFC 9535] JSONPath query engine for
 //! [`serde_json`] values.
 //!
 //! [RFC 9535] defines *JSONPath*: a query language that selects a set of nodes — the
@@ -12,7 +12,7 @@
 //! returns a [`NodeList`] — each selected value paired with its [`NormalizedPath`]:
 //!
 //! ```
-//! use jp_full::JsonPath;
+//! use jsonpath_rfc9535::JsonPath;
 //! use serde_json::json;
 //!
 //! let document = json!({
@@ -32,7 +32,7 @@
 //!
 //! let paths: Vec<_> = nodes.paths().map(ToString::to_string).collect();
 //! assert_eq!(paths, ["$['store']['book'][0]['title']"]);
-//! # Ok::<(), jp_full::Error>(())
+//! # Ok::<(), jsonpath_rfc9535::Error>(())
 //! ```
 //!
 //! # Values, or values and paths
@@ -59,9 +59,9 @@
 //! use serde_json::json;
 //!
 //! let document = json!({ "a": [1, 2, 3] });
-//! let values = jp_full::query_values("$.a[*]", &document)?;
+//! let values = jsonpath_rfc9535::query_values("$.a[*]", &document)?;
 //! assert_eq!(values, [&json!(1), &json!(2), &json!(3)]);
-//! # Ok::<(), jp_full::Error>(())
+//! # Ok::<(), jsonpath_rfc9535::Error>(())
 //! ```
 //!
 //! # Cargo features
@@ -70,7 +70,20 @@
 //!   function extensions, which require an [I-Regexp] (RFC 9485) engine backed by the
 //!   [`regex`] crate. With the feature disabled the crate builds without that
 //!   dependency, and a query using those functions is rejected by [`JsonPath::parse`]
-//!   with a clear [`Error`].
+//!   with an [`Error`].
+//!
+//! ```
+//! # #[cfg(feature = "regex")] {
+//! use serde_json::json;
+//!
+//! let users = json!([{ "name": "Ada" }, { "name": "linus" }]);
+//! // `match()` tests the whole string (anchored); `search()` tests any substring.
+//! let capitalized =
+//!     jsonpath_rfc9535::query_values(r#"$[?match(@.name, "[A-Z].*")]"#, &users)?;
+//! assert_eq!(capitalized, [&json!({ "name": "Ada" })]);
+//! # }
+//! # Ok::<(), jsonpath_rfc9535::Error>(())
+//! ```
 //!
 //! # Conformance
 //!

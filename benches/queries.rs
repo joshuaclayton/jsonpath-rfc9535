@@ -7,7 +7,7 @@
 //! reports show how evaluation scales, not just fixed per-call overhead.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use jp_full::JsonPath;
+use jsonpath_rfc9535::JsonPath;
 use serde_json::{Value, json};
 use std::hint::black_box;
 use std::path::Path;

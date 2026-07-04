@@ -1,4 +1,4 @@
-//! The query evaluator: walks a compiled [`Query`](crate::compiled::Query) over a
+//! The query evaluator: walks a compiled [`Query`] over a
 //! [`serde_json::Value`] and produces a [`NodeList`].
 //!
 //! Evaluation is infallible — a compiled query always yields a (possibly empty)
@@ -21,7 +21,7 @@ use std::borrow::Cow;
 /// How a node's location is tracked during traversal.
 ///
 /// [`NormalizedPath`] builds the real path (for [`evaluate`], which fills a
-/// [`NodeList`]). The no-op [`()`](unit) implementation is zero-sized, so value-only
+/// [`NodeList`]). The no-op [`NoPath`] implementation is zero-sized, so value-only
 /// queries ([`evaluate_values`]) and every filter sub-query skip path construction
 /// entirely — the per-node `Rc` allocation that dominates wildcard/descendant traversal.
 trait Position<'a>: Clone {
@@ -43,11 +43,20 @@ impl<'a> Position<'a> for NormalizedPath<'a> {
     }
 }
 
-impl<'a> Position<'a> for () {
+/// The no-op position for value-only evaluation: a zero-sized type whose `descend_*`
+/// methods do nothing, so `query_values` and filter sub-queries compile away all path work.
+#[derive(Clone, Copy)]
+struct NoPath;
+
+impl<'a> Position<'a> for NoPath {
     #[inline]
-    fn descend_name(&self, _name: &'a str) -> Self {}
+    fn descend_name(&self, _name: &'a str) -> Self {
+        Self
+    }
     #[inline]
-    fn descend_index(&self, _index: usize) -> Self {}
+    fn descend_index(&self, _index: usize) -> Self {
+        Self
+    }
 }
 
 /// Evaluates `query` against `root`, returning the selected nodelist with normalized
@@ -62,16 +71,14 @@ pub fn evaluate<'a>(query: &Query, root: &'a Value) -> NodeList<'a> {
 }
 
 /// Evaluates `query` against `root`, returning just the selected values in order.
-/// Tracks no paths (`P = ()`), so traversal performs no path allocation.
+/// Tracks no paths (`P = NoPath`), so traversal performs no path allocation.
 pub fn evaluate_values<'a>(query: &Query, root: &'a Value) -> Vec<&'a Value> {
-    walk(&query.segments, (), root, root)
+    walk(&query.segments, NoPath, root, root)
         .into_iter()
-        .map(|((), value)| value)
+        .map(|(_, value)| value)
         .collect()
 }
 
-// ---- Singular fast path ----------------------------------------------------------
-//
 // A query whose every segment is a single child name/index step selects at most one
 // node, so it needs neither a worklist nor any per-segment `Vec`: a single `&Value` is
 // threaded down the document. `JsonPath` precomputes this form (see
@@ -404,21 +411,19 @@ fn apply_filter<'a, P: Position<'a>>(
     }
 }
 
-// ---- Filter expression evaluation ------------------------------------------------
-
 /// Evaluates a relative (`@`) or absolute (`$`) query inside a filter, returning the
 /// values it selects. Filters observe only values and cardinality, so this skips path
-/// construction entirely (`P = ()`).
+/// construction entirely (`P = NoPath`).
 fn eval_filter_query<'a>(
     query: &FilterQuery,
     current: &'a Value,
     root: &'a Value,
-) -> Vec<((), &'a Value)> {
+) -> Vec<(NoPath, &'a Value)> {
     let start = match query.root {
         ast::QueryRoot::Current => current,
         ast::QueryRoot::Root => root,
     };
-    walk(&query.segments, (), start, root)
+    walk(&query.segments, NoPath, start, root)
 }
 
 fn eval_logical<'a>(expr: &LogicalExpr, current: &'a Value, root: &'a Value) -> bool {
@@ -435,6 +440,7 @@ fn eval_logical<'a>(expr: &LogicalExpr, current: &'a Value, root: &'a Value) -> 
             ExistenceTest::Singular(query) => eval_singular(query, current, root).is_some(),
             ExistenceTest::General(query) => !eval_filter_query(query, current, root).is_empty(),
         },
+        #[cfg(feature = "regex")]
         LogicalExpr::Test(function) => eval_logical_function(function, current, root),
     }
 }
@@ -492,8 +498,6 @@ fn index_into(value: &Value, index: i64) -> Option<&Value> {
     element_at(elements, resolved).map(|(_, element)| element)
 }
 
-// ---- Function extensions ---------------------------------------------------------
-
 fn eval_value_function<'a>(
     function: &'a Function,
     current: &'a Value,
@@ -505,7 +509,7 @@ fn eval_value_function<'a>(
             eval_filter_query(query, current, root).len(),
         ))),
         Function::Value(query) => match eval_filter_query(query, current, root).as_slice() {
-            [((), value)] => Comparand::Value(Cow::Borrowed(value)),
+            [(_, value)] => Comparand::Value(Cow::Borrowed(value)),
             _ => Comparand::Nothing,
         },
         #[cfg(feature = "regex")]
@@ -551,13 +555,6 @@ fn eval_logical_function(function: &Function, current: &Value, root: &Value) -> 
     }
 }
 
-// Without the `regex` feature, no `LogicalType` function can be compiled (the type
-// checker rejects `match`/`search`), so this is never reached with a real value.
-#[cfg(not(feature = "regex"))]
-const fn eval_logical_function(_function: &Function, _current: &Value, _root: &Value) -> bool {
-    false
-}
-
 #[cfg(feature = "regex")]
 fn regex_test(
     target: &ValueArg,
@@ -594,8 +591,7 @@ fn comparand_str<'a>(comparand: &'a Comparand<'_>) -> Option<&'a str> {
     }
 }
 
-// ---- Comparison semantics (RFC 9535 §2.3.5.2.2) ----------------------------------
-
+/// Compares two operands under the RFC 9535 §2.3.5.2.2 rules.
 fn compare(left: &Comparand, op: ast::ComparisonOp, right: &Comparand) -> bool {
     match op {
         ast::ComparisonOp::Eq => equal(left, right),

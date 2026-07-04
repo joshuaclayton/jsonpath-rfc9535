@@ -1,6 +1,6 @@
 //! Cross-library performance comparison (feature `compare`).
 //!
-//! Runs jp-full against three other engines on **equivalent queries**:
+//! Runs jsonpath-rfc9535 against three other engines on **equivalent queries**:
 //! `jsonpath_lib` (Goessner dialect — fast, the DOM baseline we want to match or beat),
 //! `jsonpath-rust` (also RFC 9535, DOM-based), and `rsonpath` (RFC 9535, but a
 //! fundamentally different *raw-bytes + SIMD* engine — see the `scan/` note below). Run
@@ -12,10 +12,10 @@
 //!
 //! Three groups, measuring three different things:
 //!
-//! * **`eval/*` (headline)** — jp-full vs `jsonpath_lib`, each query *pre-compiled once*
+//! * **`eval/*` (headline)** — jsonpath-rfc9535 vs `jsonpath_lib`, each query *pre-compiled once*
 //!   over a *pre-parsed* [`Value`], only evaluation timed. This is the realistic
 //!   compile-once/query-many usage and the metric the project optimises for. Goal:
-//!   jp-full ≤ `jsonpath_lib` on every case.
+//!   jsonpath-rfc9535 ≤ `jsonpath_lib` on every case.
 //! * **`e2e/*`** — parse-query-string + evaluate per call across the three DOM engines,
 //!   over a pre-parsed document.
 //! * **`scan/*`** — the full **text → matches** pipeline, the only fair place for
@@ -30,7 +30,7 @@
 //! so a non-equivalent query fails loudly rather than comparing apples to oranges.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use jp_full::JsonPath as JpFull;
+use jsonpath_rfc9535::JsonPath as JpFull;
 use jsonpath_rust::JsonPath as _;
 use rsonpath::engine::{Compiler, Engine, RsonpathEngine};
 use rsonpath::input::BorrowedBytes;
@@ -60,7 +60,7 @@ fn load(file: &str) -> Option<Value> {
 }
 
 /// One comparison case: the same selection expressed in each dialect. `rfc` drives
-/// jp-full and jsonpath-rust; `goessner` drives `jsonpath_lib` (its filters need the
+/// jsonpath-rfc9535 and jsonpath-rust; `goessner` drives `jsonpath_lib` (its filters need the
 /// `?(...)` parentheses); `rsonpath` drives the byte engine (standard JSONPath syntax,
 /// `None` when the engine cannot express the query — it has no filter support). A field
 /// is `None` whenever that engine cannot express the selection.
@@ -105,7 +105,7 @@ const CASES: &[Case] = &[
         rsonpath: None,
     },
     // `search()` is an RFC 9535 function extension; jsonpath_lib has no regex, so this
-    // case compares jp-full against jsonpath-rust only.
+    // case compares jsonpath-rfc9535 against jsonpath-rust only.
     Case {
         label: "filter_search",
         rfc: r#"$.store.book[?search(@.title, "Number 1")]"#,
@@ -114,7 +114,7 @@ const CASES: &[Case] = &[
     },
 ];
 
-fn count_jp_full(document: &Value, rfc: &str) -> usize {
+fn count_jsonpath_rfc9535(document: &Value, rfc: &str) -> usize {
     JpFull::parse(rfc).map_or(0, |query| query.query_values(document).len())
 }
 
@@ -141,18 +141,18 @@ fn count_rsonpath(engine: &RsonpathEngine, text: &str) -> Option<u64> {
 /// Fails the bench run if the engines do not select the same number of nodes
 /// (each engine only when it can express the query).
 fn assert_equivalent(size: &str, document: &Value, case: &Case) {
-    let jp = count_jp_full(document, case.rfc);
+    let jp = count_jsonpath_rfc9535(document, case.rfc);
     let jr = count_jsonpath_rust(document, case.rfc);
     assert_eq!(
         jp, jr,
-        "jp-full vs jsonpath-rust disagree on `{}` over {size}: {jp} vs {jr} nodes",
+        "jsonpath-rfc9535 vs jsonpath-rust disagree on `{}` over {size}: {jp} vs {jr} nodes",
         case.label
     );
     if let Some(goessner) = case.goessner {
         let gn = count_jsonpath_lib(document, goessner);
         assert_eq!(
             jp, gn,
-            "jp-full vs jsonpath_lib disagree on `{}` over {size}: {jp} vs {gn} nodes",
+            "jsonpath-rfc9535 vs jsonpath_lib disagree on `{}` over {size}: {jp} vs {gn} nodes",
             case.label
         );
     }
@@ -173,7 +173,7 @@ fn fixture_texts() -> Vec<(&'static str, String)> {
         .collect()
 }
 
-/// Pre-compiled evaluation only: jp-full vs `jsonpath_lib` (both compile once, query
+/// Pre-compiled evaluation only: jsonpath-rfc9535 vs `jsonpath_lib` (both compile once, query
 /// many). This is the metric that matters for steady-state use.
 fn bench_eval(c: &mut Criterion) {
     for (size, document) in fixtures() {
@@ -181,7 +181,7 @@ fn bench_eval(c: &mut Criterion) {
             assert_equivalent(size, &document, case);
             let mut group = c.benchmark_group(format!("eval/{size}/{}", case.label));
             if let Ok(query) = JpFull::parse(case.rfc) {
-                group.bench_function("jp-full", |b| {
+                group.bench_function("jsonpath-rfc9535", |b| {
                     b.iter(|| query.query_values(black_box(&document)));
                 });
             }
@@ -202,8 +202,10 @@ fn bench_end_to_end(c: &mut Criterion) {
     for (size, document) in fixtures() {
         for case in CASES {
             let mut group = c.benchmark_group(format!("e2e/{size}/{}", case.label));
-            group.bench_function("jp-full", |b| {
-                b.iter(|| jp_full::query_values(black_box(case.rfc), black_box(&document)));
+            group.bench_function("jsonpath-rfc9535", |b| {
+                b.iter(|| {
+                    jsonpath_rfc9535::query_values(black_box(case.rfc), black_box(&document))
+                });
             });
             if let Some(goessner) = case.goessner {
                 group.bench_function("jsonpath_lib", |b| {
@@ -235,20 +237,20 @@ fn bench_scan(c: &mut Criterion) {
             let Some(engine) = rsonpath_engine(query) else {
                 continue;
             };
-            // Cross-check rsonpath against jp-full on the parsed document before benching.
+            // Cross-check rsonpath against jsonpath-rfc9535 on the parsed document before benching.
             if let Some(count) = count_rsonpath(&engine, &text) {
-                let jp = count_jp_full(&document, case.rfc);
+                let jp = count_jsonpath_rfc9535(&document, case.rfc);
                 assert_eq!(
                     u64::try_from(jp).unwrap_or(u64::MAX),
                     count,
-                    "jp-full vs rsonpath disagree on `{}` over {size}: {jp} vs {count} nodes",
+                    "jsonpath-rfc9535 vs rsonpath disagree on `{}` over {size}: {jp} vs {count} nodes",
                     case.label
                 );
             }
 
             let mut group = c.benchmark_group(format!("scan/{size}/{}", case.label));
             if let Ok(compiled) = JpFull::parse(case.rfc) {
-                group.bench_function("jp-full (parse+query)", |b| {
+                group.bench_function("jsonpath-rfc9535 (parse+query)", |b| {
                     b.iter(|| {
                         serde_json::from_str::<Value>(black_box(&text))
                             .map_or(0, |document| compiled.query_values(&document).len())

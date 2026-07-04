@@ -26,6 +26,19 @@ impl JsonPath {
     /// Returns an [`Error`] if `query` is not syntactically valid JSONPath, contains
     /// an out-of-range integer, or uses a function extension that is unregistered,
     /// has the wrong arity, or is not well-typed.
+    ///
+    /// # Examples
+    ///
+    /// Because `parse` rejects a malformed or ill-typed query, it doubles as the way to
+    /// validate a query without running it:
+    ///
+    /// ```
+    /// use jsonpath_rfc9535::JsonPath;
+    ///
+    /// assert!(JsonPath::parse("$.store.book[0]").is_ok()); // valid
+    /// assert!(JsonPath::parse("$.store.book[").is_err()); // unclosed bracket
+    /// assert!(JsonPath::parse("$[?length(@.*) < 3]").is_err()); // ill-typed argument
+    /// ```
     pub fn parse(query: &str) -> Result<Self, Error> {
         let ast = crate::parser::parse(query)?;
         Ok(Self {

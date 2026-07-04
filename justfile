@@ -1,7 +1,8 @@
-# Default: run tests
-default: test
+# Default: the pre-merge gate — run `just ci`
+default: ci
 
-# Lint with autofix: clippy fix + fmt
+# Auto-fix lints and formatting (clippy --fix, then rustfmt)
+[group('dev')]
 lint:
   cargo clippy --fix --allow-dirty --examples --test 
   cargo fmt
@@ -11,9 +12,9 @@ lint:
 build:
   cargo build
 
-# Install required tools for testing and coverage
+# Install required tools for testing, coverage, and the docs.rs-style doc build
 [group('dev')]
-setup: setup-nextest setup-coverage setup-audit setup-toml
+setup: setup-nextest setup-coverage setup-audit setup-toml setup-nightly
 
 # Install nextest for running tests
 [group('dev')]
@@ -36,6 +37,11 @@ setup-audit:
 setup-toml:
   cargo install taplo-cli --locked
 
+# Install the nightly toolchain (used for the docs.rs-style doc build)
+[group('dev')]
+setup-nightly:
+  rustup toolchain install nightly
+
 # Run the tests in watch mode, re-running on file changes
 [group('test')]
 local-test: setup release
@@ -49,34 +55,37 @@ release:
 # Criterion baselines persist under .criterion/ (gitignored) so they survive `cargo clean`.
 CRITERION_HOME := ".criterion"
 
-# Generate the standard benchmark fixtures (idempotent). For larger scales:
-# `python3 benches/data/generate.py 50k 100k`.
-[group('dev')]
+# Generate the standard benchmark fixtures (idempotent; pass sizes to generate.py to scale up)
+[group('bench')]
 bench-fixtures:
   python3 benches/data/generate.py
 
-# Run the criterion benchmarks. Pass criterion args after `--`, e.g.
-# `just bench -- --baseline main` to compare against the saved baseline, or
-# `just bench -- parse/child` to filter.
-[group('dev')]
+# Run the criterion benchmarks (`-- --baseline main` to compare a baseline, `-- parse/child` to filter)
+[group('bench')]
 bench *ARGS: bench-fixtures
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --bench queries {{ ARGS }}
 
-# Cross-library comparison (jp-full vs jsonpath_lib / jsonpath-rust). Same `-- <args>` form.
-[group('dev')]
+# Cross-library comparison (jsonpath-rfc9535 vs jsonpath_lib / jsonpath-rust). Same `-- <args>` form.
+[group('bench')]
 bench-compare *ARGS: bench-fixtures
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --features compare --bench comparison {{ ARGS }}
 
 # Save the current numbers as the `main` baseline (the "where we started" reference).
-[group('dev')]
+[group('bench')]
 bench-save-baseline: bench-fixtures
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --bench queries -- --save-baseline main
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --features compare --bench comparison -- --save-baseline main
 
 # Run the test suite
 [group('test')]
-test-suite: setup release
+test: setup-nextest release
   cargo nextest run --workspace
+
+# Run the test suite with the `regex` feature off — verifies match()/search() are rejected
+[group('test')]
+test-no-default: setup-nextest
+  cargo nextest run --workspace --no-default-features
+  cargo test --doc --no-default-features
 
 # Verify code formatting
 [group('test')]
@@ -88,9 +97,14 @@ test-fmt:
 test-lint:
   cargo clippy --workspace --all-targets -- -D warnings
 
-# Calculate code coverage and open in-browser
+# Clippy with the regex feature off (catches dead-code/cfg breakage in the no-regex build)
 [group('test')]
-test-coverage: setup
+test-lint-no-default:
+  cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+
+# Generate the HTML coverage report and open it (on demand; not part of `just ci`)
+[group('test')]
+coverage: setup
   cargo llvm-cov nextest --workspace --tests --html --open --ignore-filename-regex test_support
 
 # Run doc tests
@@ -98,20 +112,20 @@ test-coverage: setup
 test-doc:
   cargo test --doc
 
-# Open docs
+# Build the API docs and open them in a browser
 [group('docs')]
 docs:
   cargo doc --open
 
-# Verify examples compile
-[group('test')]
-test-examples:
-  cargo check --examples
-
-# Verify doc links are valid
+# Build the docs and fail on any warning or broken link (public + private items)
 [group('test')]
 test-doc-links:
-  RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --quiet
+  RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --quiet
+
+# Build docs the docs.rs way (nightly + --cfg docsrs, -D warnings) — catches doc_cfg breakage pre-publish
+[group('test')]
+test-doc-cfg: setup-nightly
+  RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --no-deps --all-features --quiet
 
 # Verify toml formatting
 [group('test')]
@@ -123,10 +137,11 @@ test-toml: setup-toml
 test-audit: setup-audit
   cargo audit
 
-# Run full test suite
+# Everything green & ready to merge — the full CI gate (coverage is separate: `just coverage`)
 [group('test')]
-test: test-audit test-fmt test-lint test-suite test-coverage test-doc test-doc-links test-examples test-toml
+ci: test-audit test-fmt test-lint test-lint-no-default test test-no-default test-doc test-doc-links test-doc-cfg test-toml
 
+# Dry-run `cargo publish` to catch packaging problems before a real release
 [group('cargo')]
 verify-publish:
   cargo publish --dry-run --allow-dirty

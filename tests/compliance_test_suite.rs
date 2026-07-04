@@ -1,5 +1,9 @@
 //! RFC 9535 conformance harness, driven by the official JSONPath Compliance Test
-//! Suite (`tests/data/cts.json`, 703 cases).
+//! Suite (`tests/data/compliance_test_suite.json`, 703 cases).
+//!
+//! The suite exercises the full RFC — including `match()`/`search()` — so it is
+//! meaningful only with the `regex` feature, and the whole harness is gated on it.
+//! Behavioral tests for the feature boundary itself live in `regex_functions.rs`.
 //!
 //! Each case carries a `selector` plus one of:
 //! * `invalid_selector: true` — `JsonPath::parse` must reject it;
@@ -10,8 +14,9 @@
 //! This harness checks both the selected *values* and their *normalized paths*, in
 //! lockstep: a case passes only when the value at each position and its path both
 //! match. It runs every case and reports a pass/fail summary in the assertion message.
+#![cfg(feature = "regex")]
 
-use jp_full::JsonPath;
+use jsonpath_rfc9535::JsonPath;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -38,7 +43,7 @@ struct Case {
     invalid_selector: bool,
 }
 
-const SUITE: &str = include_str!("data/cts.json");
+const SUITE: &str = include_str!("data/compliance_test_suite.json");
 
 /// Maximum number of individual failures to list in the summary (keeps the message
 /// readable while iterating).
@@ -46,11 +51,12 @@ const MAX_LISTED: usize = 40;
 
 #[test]
 fn suite_loaded() {
-    let suite: Suite = serde_json::from_str(SUITE).expect("cts.json is valid JSON");
+    let suite: Suite =
+        serde_json::from_str(SUITE).expect("compliance_test_suite.json is valid JSON");
     assert_eq!(
         suite.tests.len(),
         703,
-        "the vendored CTS should contain 703 cases"
+        "the vendored compliance suite should contain 703 cases"
     );
     let invalid = suite
         .tests
@@ -65,7 +71,8 @@ fn suite_loaded() {
 
 #[test]
 fn compliance() {
-    let suite: Suite = serde_json::from_str(SUITE).expect("cts.json is valid JSON");
+    let suite: Suite =
+        serde_json::from_str(SUITE).expect("compliance_test_suite.json is valid JSON");
     let total = suite.tests.len();
     let mut failures: Vec<String> = Vec::new();
     for case in &suite.tests {
@@ -84,7 +91,7 @@ fn compliance() {
         .join("\n");
     assert!(
         failures.is_empty(),
-        "CTS: {passed}/{total} passed, {} failed (showing {}{}):\n{listing}",
+        "Compliance suite: {passed}/{total} passed, {} failed (showing {}{}):\n{listing}",
         failures.len(),
         shown.len(),
         if omitted > 0 {

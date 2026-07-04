@@ -1,5 +1,5 @@
 [package]
-name = "jp-full"
+name = "jsonpath-rfc9535"
 version = "0.1.0"
 edition = "2024"
 description = "A complete, RFC 9535 (JSONPath) compliant query engine for serde_json values."

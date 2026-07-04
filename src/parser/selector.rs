@@ -15,10 +15,8 @@
 //! * Ordering matters: `slice-selector` is tried before `index-selector`, because a
 //!   bare `int` is a prefix of a slice (`1` vs `1:3`). When the slice branch fails
 //!   for lack of a `:`, `alt` backtracks and the index branch matches.
-//! * `name-selector` delegates to [`string_literal`](super::string::string_literal),
-//!   the slice to [`slice`](super::slice::slice), the index to
-//!   [`int`](super::number::int), and the filter to
-//!   [`filter_selector`](super::filter::filter_selector).
+//! * `name-selector` delegates to [`string_literal`], the slice to [`slice()`], the index
+//!   to [`int`], and the filter to [`filter_selector`].
 
 use super::filter::filter_selector;
 use super::number::int;
