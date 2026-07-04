@@ -1,5 +1,8 @@
 # jsonpath-rfc9535
 
+[![crates.io](https://img.shields.io/crates/v/jsonpath-rfc9535.svg)](https://crates.io/crates/jsonpath-rfc9535)
+[![docs.rs](https://docs.rs/jsonpath-rfc9535/badge.svg)](https://docs.rs/jsonpath-rfc9535)
+
 A complete [RFC 9535](https://www.rfc-editor.org/rfc/rfc9535) JSONPath query engine for
 [`serde_json`](https://docs.rs/serde_json) values.
 
@@ -24,6 +27,20 @@ documents, returning the selected values and, on request, their **normalized pat
 ```toml
 [dependencies]
 jsonpath-rfc9535 = "0.1"
+```
+
+## Command-line tool
+
+The crate also ships a `jp` binary; `cargo install jsonpath-rfc9535` installs it. It reads
+JSON from a file or stdin, applies a query, and prints each selected value as JSON:
+
+```console
+$ echo '{"a": [1, 2, 3]}' | jp '$.a[?@ > 1]'
+[
+  2,
+  3
+]
+$ jp --paths '$.a[*]' data.json   # print normalized paths instead of values
 ```
 
 ## Usage
@@ -133,7 +150,7 @@ shows every recipe, grouped. Install the dev tooling once with `just setup`, the
 
 | Command | Purpose |
 |---|---|
-| `just ci` | **The pre-merge gate** — runs exactly what CI runs: fmt, clippy (both feature sets), the test suite (both feature sets), doc tests, doc generation + link check (incl. a docs.rs-style nightly build), audit, and toml. Green here means it's ready to merge. |
+| `just ci` | Runs every check CI runs: fmt, clippy (both feature sets), the test suite (both feature sets), doc tests, doc generation + link check (incl. a docs.rs-style nightly build), audit, and toml. If it passes, it's ready to merge. |
 | `just test` | Run just the test suite. |
 | `just docs` | Build the API docs and open them in a browser. |
 | `just coverage` | Generate the HTML coverage report and open it. |

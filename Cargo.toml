@@ -2,14 +2,14 @@
 name = "jsonpath-rfc9535"
 version = "0.1.0"
 edition = "2024"
-description = "A complete, RFC 9535 (JSONPath) compliant query engine for serde_json values."
+rust-version = "1.88"
+description = "A complete RFC 9535 (JSONPath) query engine for serde_json values."
 keywords = ["jsonpath", "rfc9535", "json", "query", "nom"]
 categories = ["parser-implementations", "data-structures"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-# Large benchmark fixtures and their generator are dev-only; keep them out of the
-# published .crate.
-exclude = ["/benches/data"]
+# Benchmarks and their fixtures are dev-only; keep them out of the published .crate.
+exclude = ["/benches"]
 
 [dependencies]
 nom = "^8"
@@ -56,7 +56,7 @@ redundant_else = "deny"
 default = ["regex"]
 # Enables the `match()` and `search()` function extensions, which require an
 # I-Regexp (RFC 9485) engine backed by the `regex` crate. Without this feature a
-# query that uses `match()`/`search()` fails to compile with a clear error.
+# query that uses `match()`/`search()` is rejected by `JsonPath::parse`.
 regex = ["dep:regex"]
 # Gates the cross-library comparison bench (`benches/comparison.rs`). Pulls in `regex`
 # so the `search()` case works even under `--no-default-features`. Not part of the
@@ -71,6 +71,10 @@ proptest = "1.11.0"
 rsonpath-lib = "0.10"
 rsonpath-syntax = "0.4"
 serde = { version = "1.0.228", features = ["derive"] }
+
+[[bin]]
+name = "jp"
+path = "src/main.rs"
 
 [[bench]]
 name = "queries"
