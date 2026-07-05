@@ -34,7 +34,7 @@ use rsonpath::engine::Engine as _;
 use rsonpath::input::BorrowedBytes;
 use rsonpath::result::{Match, MatchSpan, Sink};
 use serde_json::Value;
-use split::{Plan, PushdownPlan, ScanPlan};
+use split::{Plan, PushdownPlan, RootFreeSegments, ScanPlan};
 use std::fmt::{self, Display};
 
 /// How a [`ScanQuery`] chooses between the byte engine and a whole-document DOM parse.
@@ -245,9 +245,7 @@ fn run_scan(plan: &ScanPlan, json_text: &str) -> Result<Vec<Value>, ScanError> {
     let mut matches: Vec<Match> = Vec::new();
     plan.engine
         .matches(&BorrowedBytes::new(json_text.as_bytes()), &mut matches)
-        .map_err(|error| ScanError::Engine {
-            message: error.to_string(),
-        })?;
+        .map_err(engine_error)?;
     process_fragments(plan, matches)
 }
 
@@ -281,37 +279,42 @@ fn run_scan_within_budget(plan: &ScanPlan, json_text: &str) -> BudgetOutcome {
     {
         Ok(()) => BudgetOutcome::Done(process_fragments(plan, sink.matches)),
         Err(_) if sink.exceeded => BudgetOutcome::Exceeded,
-        Err(error) => BudgetOutcome::Done(Err(ScanError::Engine {
-            message: error.to_string(),
-        })),
+        Err(error) => BudgetOutcome::Done(Err(engine_error(error))),
     }
 }
 
 /// Per-fragment residual evaluation, shared by both scan pipelines: parse each
 /// fragment, filter by the predicate, then walk the residual segments with the
-/// fragment as current node *and* root (sound because the splitter rejected
-/// `$`-rooted sub-queries).
+/// fragment as current node *and* root (the plan's root-free types guarantee no
+/// `$`-rooted sub-query can observe the difference).
 fn process_fragments(plan: &ScanPlan, matches: Vec<Match>) -> Result<Vec<Value>, ScanError> {
     let mut out = Vec::new();
     for found in matches {
         let fragment: Value = serde_json::from_slice(found.bytes())
             .map_err(|source| ScanError::InvalidFragment { source })?;
-        if let Some(expr) = &plan.predicate
-            && !crate::eval::eval_logical(expr, &fragment, &fragment)
+        if let Some(predicate) = &plan.predicate
+            && !crate::eval::eval_logical(predicate.expr(), &fragment, &fragment)
         {
             continue;
         }
-        if plan.residual.is_empty() {
-            out.push(fragment);
-        } else {
-            out.extend(
-                crate::eval::walk_values(&plan.residual, &fragment, &fragment)
-                    .into_iter()
-                    .cloned(),
-            );
-        }
+        emit_through_residual(&plan.residual, fragment, &mut out);
     }
     Ok(out)
+}
+
+/// Emits one predicate-passing fragment, shared by every scan pipeline: the fragment
+/// itself when the residual is empty, otherwise every value the residual segments
+/// select from it (fragment = start = root).
+fn emit_through_residual(residual: &RootFreeSegments, fragment: Value, out: &mut Vec<Value>) {
+    if residual.is_empty() {
+        out.push(fragment);
+        return;
+    }
+    out.extend(
+        crate::eval::walk_values(residual.segments(), &fragment, &fragment)
+            .into_iter()
+            .cloned(),
+    );
 }
 
 /// The pushdown pipeline ([`Plan::Pushdown`]): decide the filter from auxiliary leaf
@@ -336,7 +339,7 @@ fn run_pushdown(plan: &PushdownPlan, json_text: &str) -> Result<Vec<Value>, Scan
     let mut candidate_spans: Vec<MatchSpan> = Vec::new();
     plan.candidates
         .approximate_spans(&input, &mut candidate_spans)
-        .map_err(|error| engine_error(&error))?;
+        .map_err(engine_error)?;
 
     // The span pass just measured the candidate set exactly, so pick the cheaper
     // finish: a small candidate set is cheaper to parse outright than to run k more
@@ -363,26 +366,30 @@ fn finish_by_parsing_candidates(
     let bytes = json_text.as_bytes();
     let mut out = Vec::new();
     for span in candidate_spans {
-        let end = span.end_idx().min(bytes.len());
-        let Some(slice) = bytes.get(span.start_idx()..end) else {
+        let Some(candidate) = parse_candidate(bytes, span)? else {
             continue;
         };
-        let candidate: Value = serde_json::from_slice(slice)
-            .map_err(|source| ScanError::InvalidFragment { source })?;
-        if !crate::eval::eval_logical(&plan.predicate, &candidate, &candidate) {
+        if !crate::eval::eval_logical(plan.predicate.expr(), &candidate, &candidate) {
             continue;
         }
-        if plan.residual.is_empty() {
-            out.push(candidate);
-        } else {
-            out.extend(
-                crate::eval::walk_values(&plan.residual, &candidate, &candidate)
-                    .into_iter()
-                    .cloned(),
-            );
-        }
+        emit_through_residual(&plan.residual, candidate, &mut out);
     }
     Ok(out)
+}
+
+/// Slices a candidate's approximate span out of the input and parses it. The span's
+/// end may be padded past the input's length with JSON whitespace (`serde_json`
+/// accepts trailing whitespace inside the slice); a span lying outside the input
+/// entirely — which engine-produced spans never do — yields `None` rather than
+/// panicking.
+fn parse_candidate(bytes: &[u8], span: &MatchSpan) -> Result<Option<Value>, ScanError> {
+    let end = span.end_idx().min(bytes.len());
+    let Some(slice) = bytes.get(span.start_idx()..end) else {
+        return Ok(None);
+    };
+    serde_json::from_slice(slice)
+        .map(Some)
+        .map_err(|source| ScanError::InvalidFragment { source })
 }
 
 /// Large candidate set: extract only the predicate's leaf values with auxiliary scans
@@ -393,77 +400,90 @@ fn finish_by_leaf_scans(
     input: &BorrowedBytes<'_>,
     candidate_spans: Vec<MatchSpan>,
 ) -> Result<Vec<Value>, ScanError> {
+    let leaf_matches = scan_leaves(plan, input)?;
+    let bytes = json_text.as_bytes();
+    let mut cursors = vec![0_usize; plan.leaves.len()];
+    let mut out = Vec::new();
+    for span in candidate_spans {
+        let synthetic = assemble_synthetic(plan, &leaf_matches, &mut cursors, &span)?;
+        if !crate::eval::eval_logical(plan.predicate.expr(), &synthetic, &synthetic) {
+            continue;
+        }
+        let Some(candidate) = parse_candidate(bytes, &span)? else {
+            continue;
+        };
+        emit_through_residual(&plan.residual, candidate, &mut out);
+    }
+    Ok(out)
+}
+
+/// Runs every auxiliary leaf engine over the whole input, collecting each path's
+/// values across all candidates in document order.
+fn scan_leaves(
+    plan: &PushdownPlan,
+    input: &BorrowedBytes<'_>,
+) -> Result<Vec<Vec<Match>>, ScanError> {
     let mut leaf_matches: Vec<Vec<Match>> = Vec::with_capacity(plan.leaves.len());
     for leaf in &plan.leaves {
         let mut sink: Vec<Match> = Vec::new();
         leaf.engine
             .matches(input, &mut sink)
-            .map_err(|error| engine_error(&error))?;
+            .map_err(engine_error)?;
         leaf_matches.push(sink);
     }
+    Ok(leaf_matches)
+}
 
-    let bytes = json_text.as_bytes();
-    let mut cursors = vec![0_usize; plan.leaves.len()];
-    let mut out = Vec::new();
-    for span in candidate_spans {
-        let mut synthetic = serde_json::Map::new();
-        for (leaf_index, leaf) in plan.leaves.iter().enumerate() {
-            let (Some(matches_list), Some(cursor)) =
-                (leaf_matches.get(leaf_index), cursors.get_mut(leaf_index))
-            else {
-                continue;
-            };
-            let mut found = None;
-            while let Some(matched) = matches_list.get(*cursor) {
-                let start = matched.span().start_idx();
-                if start < span.start_idx() {
-                    // A leaf outside any candidate cannot occur by construction;
-                    // skip defensively rather than misassign it.
-                    *cursor += 1;
-                    continue;
-                }
-                if start >= span.end_idx() {
-                    break;
-                }
-                found = Some(
-                    serde_json::from_slice::<Value>(matched.bytes())
-                        .map_err(|source| ScanError::InvalidFragment { source })?,
-                );
+/// Builds one candidate's synthetic fragment: for each leaf, consumes the matches
+/// whose start falls inside the candidate's span (cursors only ever advance — spans
+/// and leaf matches are both in document order) and places the last such value at the
+/// leaf's path. A leaf with no match in the span is simply absent, which evaluates as
+/// RFC 9535 "Nothing". `leaf_matches` and `cursors` are indexed in lockstep with
+/// `plan.leaves`.
+fn assemble_synthetic(
+    plan: &PushdownPlan,
+    leaf_matches: &[Vec<Match>],
+    cursors: &mut [usize],
+    span: &MatchSpan,
+) -> Result<Value, ScanError> {
+    let mut synthetic = serde_json::Map::new();
+    for ((leaf, matches_list), cursor) in
+        plan.leaves.iter().zip(leaf_matches).zip(cursors.iter_mut())
+    {
+        let mut found = None;
+        while let Some(matched) = matches_list.get(*cursor) {
+            let start = matched.span().start_idx();
+            if start < span.start_idx() {
+                // A leaf outside any candidate cannot occur by construction;
+                // skip defensively rather than misassign it.
                 *cursor += 1;
+                continue;
             }
-            if let Some(value) = found {
-                insert_leaf(&mut synthetic, &leaf.path, value);
+            if start >= span.end_idx() {
+                break;
             }
-        }
-        let fragment = Value::Object(synthetic);
-        if !crate::eval::eval_logical(&plan.predicate, &fragment, &fragment) {
-            continue;
-        }
-
-        let end = span.end_idx().min(bytes.len());
-        let Some(slice) = bytes.get(span.start_idx()..end) else {
-            continue;
-        };
-        let candidate: Value = serde_json::from_slice(slice)
-            .map_err(|source| ScanError::InvalidFragment { source })?;
-        if plan.residual.is_empty() {
-            out.push(candidate);
-        } else {
-            out.extend(
-                crate::eval::walk_values(&plan.residual, &candidate, &candidate)
-                    .into_iter()
-                    .cloned(),
+            // Several matches inside one span means duplicate member names: the last
+            // wins here, though the engine reports only the first — see the caveat
+            // on `ScanQuery::query_values`.
+            found = Some(
+                serde_json::from_slice::<Value>(matched.bytes())
+                    .map_err(|source| ScanError::InvalidFragment { source })?,
             );
+            *cursor += 1;
+        }
+        if let Some(value) = found {
+            insert_leaf(&mut synthetic, &leaf.path, value);
         }
     }
-    Ok(out)
+    Ok(Value::Object(synthetic))
 }
 
 /// Places a leaf value at its member-name path in the synthetic fragment, creating
-/// intermediate objects as needed. Leaves are inserted shorter-path-first (plan
-/// ordering), so an overlapping deeper leaf lands inside its parent's already-inserted
-/// object; a non-object intermediate cannot occur (the deeper leaf could not have
-/// byte-matched through a scalar) and is left untouched if it somehow does.
+/// intermediate objects as needed. Leaves arrive in the plan's lexicographic path
+/// order — a path before any extension of itself — so an overlapping deeper leaf
+/// lands inside its parent's already-inserted object; a non-object intermediate
+/// cannot occur (the deeper leaf could not have byte-matched through a scalar) and is
+/// left untouched if it somehow does.
 fn insert_leaf(target: &mut serde_json::Map<String, Value>, path: &[String], value: Value) {
     let Some((first, rest)) = path.split_first() else {
         return;
@@ -480,10 +500,11 @@ fn insert_leaf(target: &mut serde_json::Map<String, Value>, path: &[String], val
     }
 }
 
-/// Flattens an engine failure into [`ScanError::Engine`].
-fn engine_error(error: &rsonpath::engine::error::EngineError) -> ScanError {
+/// Wraps an engine failure as [`ScanError::Engine`], boxed so the typed source
+/// survives without naming the engine's error type in this crate's public API.
+fn engine_error(error: rsonpath::engine::error::EngineError) -> ScanError {
     ScanError::Engine {
-        message: error.to_string(),
+        source: Box::new(error),
     }
 }
 
@@ -556,8 +577,9 @@ pub enum ScanError {
     /// The byte-scanning engine failed: it detected malformed input, or the document
     /// nests beyond its depth limit.
     Engine {
-        /// Human-readable engine failure description.
-        message: String,
+        /// The underlying engine failure, boxed so the engine's error type stays out
+        /// of this crate's public API (its semver is not ours).
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -570,8 +592,8 @@ impl Display for ScanError {
             Self::InvalidFragment { source } => {
                 write!(f, "an extracted fragment is not valid JSON: {source}")
             }
-            Self::Engine { message } => {
-                write!(f, "the byte-scanning engine failed: {message}")
+            Self::Engine { source } => {
+                write!(f, "the byte-scanning engine failed: {source}")
             }
         }
     }
@@ -581,7 +603,7 @@ impl std::error::Error for ScanError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidJson { source } | Self::InvalidFragment { source } => Some(source),
-            Self::Engine { message: _ } => None,
+            Self::Engine { source } => Some(source.as_ref()),
         }
     }
 }
