@@ -87,6 +87,12 @@ test-no-default: setup-nextest
   cargo nextest run --workspace --no-default-features
   cargo test --doc --no-default-features
 
+# Run the test suite with the `scan` feature on — the hybrid byte-scanning evaluator
+[group('test')]
+test-scan: setup-nextest
+  cargo nextest run --workspace --features scan
+  cargo test --doc --features scan
+
 # Verify code formatting
 [group('test')]
 test-fmt:
@@ -101,6 +107,13 @@ test-lint:
 [group('test')]
 test-lint-no-default:
   cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+
+# Clippy with the scan feature on, in both regex configurations (the scan module has
+# regex-gated match arms that only one build or the other compiles)
+[group('test')]
+test-lint-scan:
+  cargo clippy --workspace --all-targets --features scan -- -D warnings
+  cargo clippy --workspace --all-targets --no-default-features --features scan -- -D warnings
 
 # Generate the HTML coverage report and open it (on demand; not part of `just ci`)
 [group('test')]
@@ -139,7 +152,7 @@ test-audit: setup-audit
 
 # Run every check CI runs; if this passes, it's ready to merge (coverage is separate: `just coverage`)
 [group('test')]
-ci: test-audit test-fmt test-lint test-lint-no-default test test-no-default test-doc test-doc-links test-doc-cfg test-toml
+ci: test-audit test-fmt test-lint test-lint-no-default test-lint-scan test test-no-default test-scan test-doc test-doc-links test-doc-cfg test-toml
 
 # Dry-run `cargo publish` to catch packaging problems before a real release
 [group('cargo')]

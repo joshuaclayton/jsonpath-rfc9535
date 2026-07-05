@@ -125,7 +125,8 @@ for the micro-benchmarks and cross-library comparisons (`just bench`, `just benc
 
 The surface is deliberately small: `JsonPath`, the `query` / `query_values` free
 functions, and the result types `NodeList`, `LocatedNode`, and `NormalizedPath` (plus
-`Error`). The grammar AST, the compiled IR, the parser, and the evaluator are private
+`Error`). The experimental `scan` feature adds `ScanQuery`, `ScanMode`, and `ScanError`.
+The grammar AST, the compiled IR, the parser, and the evaluator are private
 implementation details.
 
 ## Cargo features
@@ -134,6 +135,15 @@ implementation details.
   extensions, backed by an I-Regexp engine. With the feature disabled the crate builds
   without the [`regex`](https://docs.rs/regex) dependency, and a query that uses those
   functions is rejected by `JsonPath::parse`.
+- **`scan`** *(experimental, off by default)* — provides `ScanQuery`: evaluation over
+  **raw JSON text** that byte-scans the query's structural prefix (via
+  [rsonpath](https://docs.rs/rsonpath-lib)) and evaluates filters per extracted
+  fragment — or, when a filter's predicate allows, decides it from auxiliary scans and
+  parses only the values that pass. No whole-document DOM is ever built, so cost scales
+  with what the query selects rather than document size: 2-25x faster than
+  parse-then-query for one-shot text querying on selective queries. Adds the
+  `rsonpath-lib`/`rsonpath-syntax` dependencies and requires Rust 1.89. See the
+  `ScanQuery` docs for modes and caveats.
 
 ## Conformance
 

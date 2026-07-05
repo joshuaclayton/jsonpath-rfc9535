@@ -13,3 +13,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Normalized paths (RFC 9535 §2.7) for each selected node.
 - Conformance verified against the JSONPath Compliance Test Suite.
 - A `jp` command-line tool (installed via `cargo install jsonpath-rfc9535`) that queries JSON from a file or stdin.
+- An experimental `scan` feature: `ScanQuery` evaluates queries over raw JSON text by
+  byte-scanning the structural prefix (rsonpath) and finishing filters per extracted
+  fragment — including filter pushdown, which decides pushable predicates from
+  auxiliary scans and parses only passing candidates. `ScanMode` selects between
+  adaptive (default), forced-scan, and forced-DOM strategies. Requires Rust 1.89.
