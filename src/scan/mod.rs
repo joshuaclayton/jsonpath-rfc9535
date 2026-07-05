@@ -32,9 +32,9 @@ use crate::{Error, JsonPath};
 use core::str::FromStr;
 use rsonpath::engine::Engine as _;
 use rsonpath::input::BorrowedBytes;
-use rsonpath::result::{Match, Sink};
+use rsonpath::result::{Match, MatchSpan, Sink};
 use serde_json::Value;
-use split::{Plan, ScanPlan};
+use split::{Plan, PushdownPlan, ScanPlan};
 use std::fmt::{self, Display};
 
 /// How a [`ScanQuery`] chooses between the byte engine and a whole-document DOM parse.
@@ -157,6 +157,11 @@ impl ScanQuery {
     ///   spelling out the letter `a`) is missed in scan mode. Serializers essentially
     ///   never do this (`serde_json` does not), but it is a real divergence from DOM
     ///   evaluation.
+    /// * **Duplicate member names.** RFC 8259 calls their behavior unpredictable, and
+    ///   the pipelines here genuinely differ: DOM evaluation sees `serde_json`'s
+    ///   last-occurrence value, while a pushed-down filter judges the *first*
+    ///   occurrence (the byte engine reports only that one). Documents with duplicated
+    ///   keys get no consistency guarantee in any mode.
     /// * **Nesting depth.** Deeply nested documents error rather than evaluate: each
     ///   fragment is parsed with `serde_json` (its recursion limit applies), and the
     ///   engine has a depth cap of its own. DOM mode hits the same `serde_json` limit
@@ -174,7 +179,15 @@ impl ScanQuery {
     /// depth above its limit).
     pub fn query_values(&self, json_text: &str) -> Result<Vec<Value>, ScanError> {
         match (&self.plan, self.mode) {
-            (Plan::Dom, _) | (Plan::Scan(_), ScanMode::Dom) => self.run_dom(json_text),
+            (Plan::Dom, _) | (Plan::Scan(_) | Plan::Pushdown(_), ScanMode::Dom) => {
+                self.run_dom(json_text)
+            }
+            // Pushdown needs no adaptive budget: candidates are disjoint (child-only
+            // prefix), leaf values are scalars-or-small, and candidate bytes are only
+            // touched for candidates that pass — every cost is bounded by the input.
+            (Plan::Pushdown(plan), ScanMode::Scan | ScanMode::Adaptive) => {
+                run_pushdown(plan, json_text)
+            }
             (Plan::Scan(plan), ScanMode::Scan) => run_scan(plan, json_text),
             (Plan::Scan(plan), ScanMode::Adaptive) => {
                 if plan.whole_document {
@@ -210,9 +223,10 @@ impl ScanQuery {
     #[must_use]
     pub fn uses_scan(&self) -> bool {
         match (&self.plan, self.mode) {
-            (Plan::Dom, _) | (Plan::Scan(_), ScanMode::Dom) => false,
+            (Plan::Dom, _) | (Plan::Scan(_) | Plan::Pushdown(_), ScanMode::Dom) => false,
             (Plan::Scan(plan), ScanMode::Adaptive) => !plan.whole_document,
-            (Plan::Scan(_), ScanMode::Scan) => true,
+            (Plan::Scan(_), ScanMode::Scan)
+            | (Plan::Pushdown(_), ScanMode::Scan | ScanMode::Adaptive) => true,
         }
     }
 }
@@ -298,6 +312,179 @@ fn process_fragments(plan: &ScanPlan, matches: Vec<Match>) -> Result<Vec<Value>,
         }
     }
     Ok(out)
+}
+
+/// The pushdown pipeline ([`Plan::Pushdown`]): decide the filter from auxiliary leaf
+/// scans, extract only the candidates that pass.
+///
+/// 1. `approximate_spans` yields each candidate's span — starts exact, ends possibly
+///    padded with JSON whitespace (and possibly past the input's end) — with no byte
+///    copying. Child-only prefixes guarantee the spans are disjoint and in document
+///    order.
+/// 2. Each leaf engine extracts its path's values across all candidates, in document
+///    order. A leaf value is assigned to the candidate whose span contains its start;
+///    when a candidate somehow yields several (duplicate member names), the last one
+///    wins (though the engine itself reports only the first — see the caveat on
+///    [`ScanQuery::query_values`]).
+/// 3. Per candidate, the leaf values are assembled into a synthetic fragment — an
+///    object holding just the paths the predicate consults; a missing leaf is simply
+///    absent, which evaluates as RFC 9535 "Nothing" — and the predicate runs on it.
+/// 4. Only passing candidates are sliced out of the input and parsed; the trailing
+///    whitespace an approximate span may include is accepted by `serde_json`.
+fn run_pushdown(plan: &PushdownPlan, json_text: &str) -> Result<Vec<Value>, ScanError> {
+    let input = BorrowedBytes::new(json_text.as_bytes());
+    let mut candidate_spans: Vec<MatchSpan> = Vec::new();
+    plan.candidates
+        .approximate_spans(&input, &mut candidate_spans)
+        .map_err(|error| engine_error(&error))?;
+
+    // The span pass just measured the candidate set exactly, so pick the cheaper
+    // finish: a small candidate set is cheaper to parse outright than to run k more
+    // whole-document leaf scans over; a large one is worth the leaf scans to avoid
+    // parsing candidates the filter will drop. The 32:1 factor understates the
+    // measured parse:scan cost per byte, so the direct route is only taken when it
+    // clearly wins.
+    let candidate_bytes: usize = candidate_spans.iter().map(MatchSpan::len).sum();
+    let leaf_scan_equivalent = json_text.len().saturating_mul(plan.leaves.len().max(1));
+    if candidate_bytes.saturating_mul(32) <= leaf_scan_equivalent {
+        return finish_by_parsing_candidates(plan, json_text, &candidate_spans);
+    }
+    finish_by_leaf_scans(plan, json_text, &input, candidate_spans)
+}
+
+/// Small candidate set: parse every candidate and run the predicate on the real
+/// fragment — one scan pass total, the old fragment-scan cost profile without the
+/// byte copies.
+fn finish_by_parsing_candidates(
+    plan: &PushdownPlan,
+    json_text: &str,
+    candidate_spans: &[MatchSpan],
+) -> Result<Vec<Value>, ScanError> {
+    let bytes = json_text.as_bytes();
+    let mut out = Vec::new();
+    for span in candidate_spans {
+        let end = span.end_idx().min(bytes.len());
+        let Some(slice) = bytes.get(span.start_idx()..end) else {
+            continue;
+        };
+        let candidate: Value = serde_json::from_slice(slice)
+            .map_err(|source| ScanError::InvalidFragment { source })?;
+        if !crate::eval::eval_logical(&plan.predicate, &candidate, &candidate) {
+            continue;
+        }
+        if plan.residual.is_empty() {
+            out.push(candidate);
+        } else {
+            out.extend(
+                crate::eval::walk_values(&plan.residual, &candidate, &candidate)
+                    .into_iter()
+                    .cloned(),
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Large candidate set: extract only the predicate's leaf values with auxiliary scans
+/// and parse just the candidates that pass.
+fn finish_by_leaf_scans(
+    plan: &PushdownPlan,
+    json_text: &str,
+    input: &BorrowedBytes<'_>,
+    candidate_spans: Vec<MatchSpan>,
+) -> Result<Vec<Value>, ScanError> {
+    let mut leaf_matches: Vec<Vec<Match>> = Vec::with_capacity(plan.leaves.len());
+    for leaf in &plan.leaves {
+        let mut sink: Vec<Match> = Vec::new();
+        leaf.engine
+            .matches(input, &mut sink)
+            .map_err(|error| engine_error(&error))?;
+        leaf_matches.push(sink);
+    }
+
+    let bytes = json_text.as_bytes();
+    let mut cursors = vec![0_usize; plan.leaves.len()];
+    let mut out = Vec::new();
+    for span in candidate_spans {
+        let mut synthetic = serde_json::Map::new();
+        for (leaf_index, leaf) in plan.leaves.iter().enumerate() {
+            let (Some(matches_list), Some(cursor)) =
+                (leaf_matches.get(leaf_index), cursors.get_mut(leaf_index))
+            else {
+                continue;
+            };
+            let mut found = None;
+            while let Some(matched) = matches_list.get(*cursor) {
+                let start = matched.span().start_idx();
+                if start < span.start_idx() {
+                    // A leaf outside any candidate cannot occur by construction;
+                    // skip defensively rather than misassign it.
+                    *cursor += 1;
+                    continue;
+                }
+                if start >= span.end_idx() {
+                    break;
+                }
+                found = Some(
+                    serde_json::from_slice::<Value>(matched.bytes())
+                        .map_err(|source| ScanError::InvalidFragment { source })?,
+                );
+                *cursor += 1;
+            }
+            if let Some(value) = found {
+                insert_leaf(&mut synthetic, &leaf.path, value);
+            }
+        }
+        let fragment = Value::Object(synthetic);
+        if !crate::eval::eval_logical(&plan.predicate, &fragment, &fragment) {
+            continue;
+        }
+
+        let end = span.end_idx().min(bytes.len());
+        let Some(slice) = bytes.get(span.start_idx()..end) else {
+            continue;
+        };
+        let candidate: Value = serde_json::from_slice(slice)
+            .map_err(|source| ScanError::InvalidFragment { source })?;
+        if plan.residual.is_empty() {
+            out.push(candidate);
+        } else {
+            out.extend(
+                crate::eval::walk_values(&plan.residual, &candidate, &candidate)
+                    .into_iter()
+                    .cloned(),
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Places a leaf value at its member-name path in the synthetic fragment, creating
+/// intermediate objects as needed. Leaves are inserted shorter-path-first (plan
+/// ordering), so an overlapping deeper leaf lands inside its parent's already-inserted
+/// object; a non-object intermediate cannot occur (the deeper leaf could not have
+/// byte-matched through a scalar) and is left untouched if it somehow does.
+fn insert_leaf(target: &mut serde_json::Map<String, Value>, path: &[String], value: Value) {
+    let Some((first, rest)) = path.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        target.insert(first.clone(), value);
+        return;
+    }
+    let entry = target
+        .entry(first.clone())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Value::Object(inner) = entry {
+        insert_leaf(inner, rest, value);
+    }
+}
+
+/// Flattens an engine failure into [`ScanError::Engine`].
+fn engine_error(error: &rsonpath::engine::error::EngineError) -> ScanError {
+    ScanError::Engine {
+        message: error.to_string(),
+    }
 }
 
 /// A [`Sink`] that aborts the engine run once cumulative fragment bytes pass `budget`.
@@ -609,12 +796,12 @@ mod tests {
 
     #[test]
     fn adaptive_routes_whole_document_prefixes_to_dom() {
-        // `$[?P]` renders to prefix `$[*]`: fragments cover the whole document for any
+        // `$[*]` selects every root child: fragments cover the whole document for any
         // input, so adaptive mode must not even attempt the byte engine.
-        let query = ScanQuery::parse("$[?@.x]").expect("`$[?@.x]` compiles");
+        let query = ScanQuery::parse("$[*]").expect("`$[*]` compiles");
         assert!(
             !query.uses_scan(),
-            "adaptive: a root-level filter is statically non-selective, so it goes DOM"
+            "adaptive: `$[*]` is statically non-selective, so it goes DOM"
         );
         assert!(
             query.clone().with_mode(ScanMode::Scan).uses_scan(),
@@ -626,11 +813,126 @@ mod tests {
         );
         assert_eq!(
             query
-                .query_values(r#"[{"x": 1}, {"y": 2}]"#)
+                .query_values(r#"[{"x": 1}, 2]"#)
                 .expect("evaluation must succeed on valid JSON"),
-            [json!({"x": 1})],
+            [json!({"x": 1}), json!(2)],
             "the DOM route still answers the query correctly"
         );
+    }
+
+    #[test]
+    fn root_level_filters_push_down_instead_of_dom_routing() {
+        // `$[?P]` used to be statically whole-document; with pushdown only the leaf
+        // values and the passing candidates are ever touched, so it scans again.
+        let query = ScanQuery::parse("$[?@.x]").expect("`$[?@.x]` compiles");
+        assert!(
+            query.uses_scan(),
+            "a pushable root-level filter takes the byte engine via pushdown"
+        );
+        assert_eq!(
+            query
+                .query_values(r#"[{"x": 1}, {"y": 2}, {"x": 3}]"#)
+                .expect("evaluation must succeed on valid JSON"),
+            [json!({"x": 1}), json!({"x": 3})],
+            "pushdown answers the root-level filter correctly"
+        );
+    }
+
+    #[test]
+    fn pushdown_agrees_with_dom_across_predicate_shapes() {
+        let text = r#"{"items": [
+            {"n": 1, "tag": "keep", "meta": {"depth": 2}},
+            {"n": 5, "tag": "drop"},
+            {"n": 9, "meta": {"depth": 1}},
+            {"tag": "keep", "meta": {"depth": 9}}
+        ]}"#;
+        for query in [
+            "$.items[?@.n > 2]",
+            "$.items[?@.n]",
+            "$.items[?!@.n]",
+            r#"$.items[?@.tag == "keep"]"#,
+            "$.items[?@.meta.depth > 1]",
+            r#"$.items[?@.n < 6 && @.tag == "keep"]"#,
+            r#"$.items[?@.tag == "keep" || @.meta.depth > 1]"#,
+            "$.items[?@.n > 2].n",
+        ] {
+            let scan = ScanQuery::parse(query).expect("test query must compile");
+            assert!(scan.uses_scan(), "`{query}` must push down");
+            let (scanned, dom) = both(query, text);
+            assert_eq!(scanned, dom, "`{query}`: pushdown and DOM agree");
+            assert!(
+                !scanned.is_empty(),
+                "`{query}` selects something (non-vacuous test)"
+            );
+        }
+    }
+
+    #[test]
+    fn pushdown_direct_and_leaf_scan_finishes_agree() {
+        // Same query, two documents: in the padded one the candidates are a sliver of
+        // the input (the span pass chooses the direct parse — no leaf scans); in the
+        // bare one they are essentially the whole input (leaf scans + synthetic
+        // fragments). Both must match DOM.
+        let items = r#"[{"n": 1}, {"n": 5}, {"n": 9}]"#;
+        let padded = format!(r#"{{"pad": "{}", "items": {items}}}"#, "x".repeat(4096));
+        let bare = format!(r#"{{"items": {items}}}"#);
+        for text in [padded.as_str(), bare.as_str()] {
+            let (scanned, dom) = both("$.items[?@.n > 2]", text);
+            assert_eq!(scanned, dom, "both pushdown finishes agree with DOM");
+            assert_eq!(scanned.len(), 2, "two items pass the predicate");
+        }
+    }
+
+    #[test]
+    fn pushdown_sees_the_first_duplicate_member_where_dom_sees_the_last() {
+        // Duplicate member names are "unpredictable behavior" per RFC 8259, and the
+        // two pipelines genuinely diverge (verified against rsonpath 0.10): the byte
+        // engine reports only the FIRST occurrence of a duplicated member, while
+        // serde_json's parsed Value keeps the LAST. This test pins the divergence so
+        // a change in either engine surfaces loudly; the caveat is documented on
+        // `query_values`.
+        let text = r#"{"a": [{"x": 1, "x": 9}, {"x": 2}]}"#;
+        let query = "$.a[?@.x > 5]";
+        let pushdown = ScanQuery::parse(query)
+            .expect("test query must compile")
+            .with_mode(ScanMode::Scan)
+            .query_values(text)
+            .expect("scan evaluation must succeed");
+        assert!(
+            pushdown.is_empty(),
+            "pushdown judges the first occurrence (1 > 5 is false)"
+        );
+        let document: Value = serde_json::from_str(text).expect("test document must parse");
+        let dom: Vec<Value> = JsonPath::parse(query)
+            .expect("test query must compile")
+            .query_values(&document)
+            .into_iter()
+            .cloned()
+            .collect();
+        assert_eq!(
+            dom,
+            [json!({"x": 9})],
+            "DOM judges serde's last-wins value (9 > 5 is true)"
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn pushdown_evaluates_regex_functions_on_extracted_leaves() {
+        let text = r#"{"books": [
+            {"title": "Rust in Action"},
+            {"title": "The C Programming Language"},
+            {"title": "Rust for Rustaceans"}
+        ]}"#;
+        let query = r#"$.books[?search(@.title, "Rust")].title"#;
+        let scan = ScanQuery::parse(query).expect("test query must compile");
+        assert!(scan.uses_scan(), "a literal-pattern search pushes down");
+        let (scanned, dom) = both(query, text);
+        assert_eq!(
+            scanned, dom,
+            "search() over an extracted string leaf agrees"
+        );
+        assert_eq!(scanned.len(), 2, "both Rust titles match");
     }
 
     #[test]
