@@ -14,6 +14,9 @@
 //! those compare as multisets.
 #![cfg(feature = "scan")]
 
+mod common;
+
+use common::multiset;
 use jsonpath_rfc9535::{JsonPath, ScanMode, ScanQuery};
 use proptest::prelude::*;
 use serde_json::Value;
@@ -85,11 +88,4 @@ proptest! {
             );
         }
     }
-}
-
-/// Order-insensitive rendering: sorted compact-JSON strings.
-fn multiset(values: &[Value]) -> Vec<String> {
-    let mut rendered: Vec<String> = values.iter().map(ToString::to_string).collect();
-    rendered.sort();
-    rendered
 }

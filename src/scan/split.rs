@@ -13,8 +13,10 @@
 //!
 //! A residual is only sound if it never references `$`: fragments are evaluated with
 //! themselves as the root, so an absolute sub-query (`[?@.price < $.max]`) would resolve
-//! against the wrong document. [`split`] walks every corner of the IR that can embed a
-//! sub-query and falls back to [`Plan::Dom`] on any `$` reference.
+//! against the wrong document. The check walks every corner of the IR that can embed a
+//! sub-query, and the [`RootFreePredicate`]/[`RootFreeSegments`] wrappers make passing
+//! it the only way into a plan's predicate/residual slots — any `$` reference falls
+//! back to [`Plan::Dom`].
 //!
 //! [`RsonpathEngine::compile_query`] is the final oracle: whatever the eligibility rules
 //! missed (engine limits, unsupported shapes) surfaces as a `CompilerError` and demotes
@@ -50,9 +52,9 @@ pub struct ScanPlan {
     /// `predicate` is present).
     pub engine: RsonpathEngine,
     /// The filter cut out of the first residual segment, applied to each fragment.
-    pub predicate: Option<LogicalExpr>,
+    pub predicate: Option<RootFreePredicate>,
     /// Segments evaluated over each surviving fragment (fragment = start = root).
-    pub residual: Vec<Segment>,
+    pub residual: RootFreeSegments,
     /// The rendered prefix selects every child of the root (`$[*]`) or every node
     /// (`$..*`), so its fragments cover essentially the whole document *for any
     /// document* — byte-scanning cannot beat one DOM parse. Statically known at
@@ -74,9 +76,9 @@ pub struct PushdownPlan {
     /// One auxiliary engine per distinct singular path the predicate references.
     pub leaves: Vec<LeafPlan>,
     /// The filter, evaluated per candidate against the synthetic fragment.
-    pub predicate: LogicalExpr,
+    pub predicate: RootFreePredicate,
     /// Segments evaluated over each passing candidate (candidate = start = root).
-    pub residual: Vec<Segment>,
+    pub residual: RootFreeSegments,
 }
 
 /// One predicate leaf: the `@`-relative member-name chain and the engine that
@@ -86,9 +88,55 @@ pub struct LeafPlan {
     /// Engine for the leaf's values across all candidates, in document order.
     pub engine: RsonpathEngine,
     /// The member-name steps, used to place extracted values in the synthetic
-    /// fragment. Sorted shorter-first at plan time so nested leaves insert into
-    /// their parents' already-placed objects.
+    /// fragment. The plan's leaves are in lexicographic path order, which puts a path
+    /// before any extension of itself — the placement order `insert_leaf` relies on
+    /// to nest deeper leaves inside their parents' already-placed objects.
     pub path: Vec<String>,
+}
+
+/// A filter expression verified at construction to reference no `$`-rooted sub-query,
+/// however deeply nested.
+///
+/// Fragments are evaluated as their own root, so an absolute sub-query would resolve
+/// against the wrong document; [`checked`](Self::checked) refuses such expressions and
+/// is the only constructor — holding one of these *is* the soundness proof.
+#[derive(Debug, Clone)]
+pub struct RootFreePredicate(LogicalExpr);
+
+impl RootFreePredicate {
+    /// Verifies and wraps `expr`; `None` when it references `$` anywhere.
+    fn checked(expr: &LogicalExpr) -> Option<Self> {
+        (!expr_has_root_query(expr)).then(|| Self(expr.clone()))
+    }
+
+    /// The verified expression, for per-fragment evaluation.
+    pub const fn expr(&self) -> &LogicalExpr {
+        &self.0
+    }
+}
+
+/// Residual segments verified at construction to embed no `$`-rooted sub-query in any
+/// filter, however deeply nested — the only segment shape that may soundly walk a
+/// fragment acting as its own root. [`checked`](Self::checked) is the only
+/// constructor.
+#[derive(Debug, Clone)]
+pub struct RootFreeSegments(Vec<Segment>);
+
+impl RootFreeSegments {
+    /// Verifies and wraps `segments`; `None` when any embedded filter references `$`.
+    fn checked(segments: &[Segment]) -> Option<Self> {
+        (!segments_have_root(segments)).then(|| Self(segments.to_vec()))
+    }
+
+    /// Whether there is nothing to walk (fragments are emitted as-is).
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The verified segments, for the evaluator's walk.
+    pub fn segments(&self) -> &[Segment] {
+        &self.0
+    }
 }
 
 /// Auxiliary scans are cheap (~5% of a parse each) but not free; a predicate
@@ -108,60 +156,82 @@ pub fn split(query: &Query) -> Plan {
         .iter()
         .position(|segment| !prefix_eligible(segment))
         .unwrap_or(segments.len());
+    let filter_cut = filter_at_cut(segments.get(cut));
+    let residual_start = if filter_cut.is_some() { cut + 1 } else { cut };
 
-    // A cut at a child segment holding exactly one filter becomes a per-fragment
-    // predicate (the prefix gains the `[*]` the filter iterates as).
-    let filter_cut = match segments.get(cut) {
+    // Soundness: fragments are their own root, so nothing past the cut may mention
+    // `$`. The checked constructors are the only way into the plans' slots; a `$`
+    // reference anywhere past the cut demotes to DOM.
+    let Some(residual) =
+        RootFreeSegments::checked(segments.get(residual_start..).unwrap_or_default())
+    else {
+        return Plan::Dom;
+    };
+    let predicate = match filter_cut.map(RootFreePredicate::checked) {
+        Some(None) => return Plan::Dom,
+        Some(Some(predicate)) => Some(predicate),
+        None => None,
+    };
+    let Some(prefix) = segments.get(..cut) else {
+        return Plan::Dom;
+    };
+
+    // A pushable filter beats the plain fragment scan: leaf scans decide the
+    // predicate and only passing candidates are extracted, so even a filter at the
+    // root (`$[?P]`) is worth scanning this way.
+    if let Some(predicate) = &predicate
+        && let Some(plan) = build_pushdown(prefix, predicate, &residual)
+    {
+        return Plan::Pushdown(Box::new(plan));
+    }
+    if prefix.is_empty() && predicate.is_none() {
+        // The prefix would be a bare `$`: one whole-document fragment, i.e. a DOM parse
+        // with extra steps. (An empty prefix *with* a predicate stays: `$[?P]` → `$[*]` + P.)
+        return Plan::Dom;
+    }
+    // Exactly two rendered-prefix shapes select ~the whole document no matter what the
+    // document contains: `$[?P]…` renders to `$[*]` (fragments = every child of the
+    // root), and a lone bare wildcard step (`$[*]` / `$..*`) does the same or worse.
+    // Deeper wildcards (`$.a[*]`) are data-dependent and stay unmarked.
+    let whole_document = if predicate.is_some() {
+        prefix.is_empty()
+    } else {
+        matches!(prefix, [segment] if is_bare_wildcard(segment))
+    };
+    build_scan(prefix, predicate, residual, whole_document)
+}
+
+/// The filter a cut segment contributes as a per-fragment predicate: present exactly
+/// when the segment is a child segment holding a single filter selector (the prefix
+/// then gains the `[*]` the filter iterates as).
+fn filter_at_cut(segment: Option<&Segment>) -> Option<&LogicalExpr> {
+    match segment {
         Some(Segment::Child(selectors)) => match selectors.as_slice() {
             [Selector::Filter(expr)] => Some(expr),
             _ => None,
         },
         Some(Segment::Descendant(_)) | None => None,
-    };
-    let residual_start = if filter_cut.is_some() { cut + 1 } else { cut };
-    let residual = segments.get(residual_start..).unwrap_or_default();
+    }
+}
 
-    // Soundness: fragments are their own root, so nothing past the cut may mention `$`.
-    if filter_cut.is_some_and(expr_has_root_query) || segments_have_root(residual) {
-        return Plan::Dom;
-    }
-    // A pushable filter beats the plain fragment scan: leaf scans decide the
-    // predicate and only passing candidates are extracted, so even a filter at the
-    // root (`$[?P]`) is worth scanning this way.
-    if let Some(expr) = filter_cut
-        && let Some(prefix) = segments.get(..cut)
-        && let Some(plan) = build_pushdown(prefix, expr, residual)
-    {
-        return Plan::Pushdown(Box::new(plan));
-    }
-    if cut == 0 && filter_cut.is_none() {
-        // The prefix would be a bare `$`: one whole-document fragment, i.e. a DOM parse
-        // with extra steps. (`cut == 0` *with* a predicate stays: `$[?P]` → `$[*]` + P.)
-        return Plan::Dom;
-    }
-
-    let Some(prefix) = segments.get(..cut) else {
+/// Compiles the plain fragment-scan plan: render the prefix (plus the `[*]` a
+/// predicate iterates over) and let the engine's compiler have the final word on
+/// expressibility — anything the eligibility rules let through that it cannot compile
+/// (engine limits, exotic shapes) demotes to DOM.
+fn build_scan(
+    prefix: &[Segment],
+    predicate: Option<RootFreePredicate>,
+    residual: RootFreeSegments,
+    whole_document: bool,
+) -> Plan {
+    let Some(rendered) = render_prefix(prefix, predicate.is_some()) else {
         return Plan::Dom;
     };
-    // Exactly two rendered-prefix shapes select ~the whole document no matter what the
-    // document contains: `$[?P]…` renders to `$[*]` (fragments = every child of the
-    // root), and a lone bare wildcard step (`$[*]` / `$..*`) does the same or worse.
-    // Deeper wildcards (`$.a[*]`) are data-dependent and stay unmarked.
-    let whole_document = if filter_cut.is_some() {
-        prefix.is_empty()
-    } else {
-        matches!(prefix, [segment] if is_bare_wildcard(segment))
-    };
-    let Some(rendered) = render_prefix(prefix, filter_cut.is_some()) else {
-        return Plan::Dom;
-    };
-    // The engine is the last word on expressibility: anything the rules above let
-    // through that it cannot compile (engine limits, exotic shapes) demotes to DOM.
     RsonpathEngine::compile_query(&rendered).map_or(Plan::Dom, |engine| {
         Plan::Scan(Box::new(ScanPlan {
             engine,
-            predicate: filter_cut.cloned(),
-            residual: residual.to_vec(),
+            predicate,
+            residual,
             whole_document,
         }))
     })
@@ -178,8 +248,8 @@ pub fn split(query: &Query) -> Plan {
 /// `None` falls back to the plain fragment scan.
 fn build_pushdown(
     prefix: &[Segment],
-    expr: &LogicalExpr,
-    residual: &[Segment],
+    predicate: &RootFreePredicate,
+    residual: &RootFreeSegments,
 ) -> Option<PushdownPlan> {
     if prefix
         .iter()
@@ -188,9 +258,12 @@ fn build_pushdown(
         return None;
     }
     let mut paths = Vec::new();
-    if !collect_pushdown_paths(expr, &mut paths) {
+    if !collect_pushdown_paths(predicate.expr(), &mut paths) {
         return None;
     }
+    // Lexicographic order puts a path before its own extensions — the placement
+    // order `insert_leaf` relies on to nest deeper leaves inside already-placed
+    // parents. `dedup` then folds repeated references into a single scan.
     paths.sort();
     paths.dedup();
     if paths.len() > MAX_PUSHDOWN_LEAVES {
@@ -207,8 +280,8 @@ fn build_pushdown(
     Some(PushdownPlan {
         candidates,
         leaves,
-        predicate: expr.clone(),
-        residual: residual.to_vec(),
+        predicate: predicate.clone(),
+        residual: residual.clone(),
     })
 }
 
@@ -498,8 +571,12 @@ mod tests {
     fn kind(query: &str) -> Kind {
         let path = JsonPath::parse(query).expect("test query must compile");
         match split(path.compiled()) {
-            Plan::Scan(plan) => Kind::Scan(plan.predicate.is_some(), plan.residual.len()),
-            Plan::Pushdown(plan) => Kind::Pushdown(plan.leaves.len(), plan.residual.len()),
+            Plan::Scan(plan) => {
+                Kind::Scan(plan.predicate.is_some(), plan.residual.segments().len())
+            }
+            Plan::Pushdown(plan) => {
+                Kind::Pushdown(plan.leaves.len(), plan.residual.segments().len())
+            }
             Plan::Dom => Kind::Dom,
         }
     }

@@ -23,6 +23,9 @@
 //! floor is what fails.
 #![cfg(all(feature = "scan", feature = "regex"))]
 
+mod common;
+
+use common::multiset;
 use jsonpath_rfc9535::{JsonPath, ScanMode, ScanQuery};
 use serde::Deserialize;
 use serde_json::Value;
@@ -141,11 +144,4 @@ fn run_case(case: &Case) -> Result<bool, String> {
         }
     }
     Ok(forced.uses_scan())
-}
-
-/// Order-insensitive rendering: sorted compact-JSON strings.
-fn multiset(values: &[Value]) -> Vec<String> {
-    let mut rendered: Vec<String> = values.iter().map(ToString::to_string).collect();
-    rendered.sort();
-    rendered
 }
