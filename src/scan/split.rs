@@ -35,6 +35,9 @@ pub enum Plan {
     /// filtered by the predicate, then walked with the residual segments. Boxed:
     /// the engine's automaton dwarfs the `Dom` variant.
     Scan(Box<ScanPlan>),
+    /// The filter is decided from auxiliary scans over its singular leaf paths;
+    /// only candidates that pass are ever extracted and parsed.
+    Pushdown(Box<PushdownPlan>),
     /// Unsplittable query: parse the whole document and evaluate normally.
     Dom,
 }
@@ -57,6 +60,40 @@ pub struct ScanPlan {
     /// to DOM without touching the input.
     pub whole_document: bool,
 }
+
+/// A filter-pushdown execution plan: instead of extracting and parsing every
+/// candidate to decide the filter, the predicate's *leaf values* are pulled out with
+/// auxiliary byte scans, the filter is decided on a synthetic fragment assembled from
+/// them, and only passing candidates are extracted at all. Parse cost scales with the
+/// filter's pass rate rather than the candidate set's size.
+#[derive(Debug, Clone)]
+pub struct PushdownPlan {
+    /// Engine yielding each candidate's span: the prefix plus the filter's `[*]`.
+    /// Spans only — candidate bytes are never copied unless the candidate passes.
+    pub candidates: RsonpathEngine,
+    /// One auxiliary engine per distinct singular path the predicate references.
+    pub leaves: Vec<LeafPlan>,
+    /// The filter, evaluated per candidate against the synthetic fragment.
+    pub predicate: LogicalExpr,
+    /// Segments evaluated over each passing candidate (candidate = start = root).
+    pub residual: Vec<Segment>,
+}
+
+/// One predicate leaf: the `@`-relative member-name chain and the engine that
+/// extracts its values (`prefix[*].<path>`).
+#[derive(Debug, Clone)]
+pub struct LeafPlan {
+    /// Engine for the leaf's values across all candidates, in document order.
+    pub engine: RsonpathEngine,
+    /// The member-name steps, used to place extracted values in the synthetic
+    /// fragment. Sorted shorter-first at plan time so nested leaves insert into
+    /// their parents' already-placed objects.
+    pub path: Vec<String>,
+}
+
+/// Auxiliary scans are cheap (~5% of a parse each) but not free; a predicate
+/// consulting more paths than this falls back to the plain fragment scan.
+const MAX_PUSHDOWN_LEAVES: usize = 8;
 
 /// Splits `query` into a byte-scannable prefix and a residual plan, falling back to
 /// [`Plan::Dom`] whenever the split would be unsound or worthless.
@@ -87,6 +124,15 @@ pub fn split(query: &Query) -> Plan {
     // Soundness: fragments are their own root, so nothing past the cut may mention `$`.
     if filter_cut.is_some_and(expr_has_root_query) || segments_have_root(residual) {
         return Plan::Dom;
+    }
+    // A pushable filter beats the plain fragment scan: leaf scans decide the
+    // predicate and only passing candidates are extracted, so even a filter at the
+    // root (`$[?P]`) is worth scanning this way.
+    if let Some(expr) = filter_cut
+        && let Some(prefix) = segments.get(..cut)
+        && let Some(plan) = build_pushdown(prefix, expr, residual)
+    {
+        return Plan::Pushdown(Box::new(plan));
     }
     if cut == 0 && filter_cut.is_none() {
         // The prefix would be a bare `$`: one whole-document fragment, i.e. a DOM parse
@@ -119,6 +165,136 @@ pub fn split(query: &Query) -> Plan {
             whole_document,
         }))
     })
+}
+
+/// Builds a pushdown plan when the shape allows deciding the filter from auxiliary
+/// scans alone. Requirements:
+///
+/// * **Child-only prefix** — descendant steps could nest one candidate inside
+///   another, making span-containment alignment of leaf values ambiguous.
+/// * **Pushable predicate** — every query embedded in the filter is a singular,
+///   `@`-rooted chain of scannable member names (see [`collect_pushdown_paths`]).
+///
+/// `None` falls back to the plain fragment scan.
+fn build_pushdown(
+    prefix: &[Segment],
+    expr: &LogicalExpr,
+    residual: &[Segment],
+) -> Option<PushdownPlan> {
+    if prefix
+        .iter()
+        .any(|segment| matches!(segment, Segment::Descendant(_)))
+    {
+        return None;
+    }
+    let mut paths = Vec::new();
+    if !collect_pushdown_paths(expr, &mut paths) {
+        return None;
+    }
+    paths.sort();
+    paths.dedup();
+    if paths.len() > MAX_PUSHDOWN_LEAVES {
+        return None;
+    }
+    let candidates = RsonpathEngine::compile_query(&render_prefix(prefix, true)?).ok()?;
+    let leaves = paths
+        .into_iter()
+        .map(|path| {
+            let engine = RsonpathEngine::compile_query(&render_leaf(prefix, &path)?).ok()?;
+            Some(LeafPlan { engine, path })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(PushdownPlan {
+        candidates,
+        leaves,
+        predicate: expr.clone(),
+        residual: residual.to_vec(),
+    })
+}
+
+// The pushability walk: mirrors the `$`-reference check's shape, but additionally
+// collects every singular path the predicate consults. A filter is pushable iff every
+// embedded query is a singular `@`-rooted chain of scannable member names — anything
+// else (general sub-queries, `count`/`value`, index steps, bare `@`) needs the real
+// fragment and falls back to the plain scan.
+
+fn collect_pushdown_paths(expr: &LogicalExpr, paths: &mut Vec<Vec<String>>) -> bool {
+    match expr {
+        LogicalExpr::Or(left, right) | LogicalExpr::And(left, right) => {
+            collect_pushdown_paths(left, paths) && collect_pushdown_paths(right, paths)
+        }
+        LogicalExpr::Not(inner) => collect_pushdown_paths(inner, paths),
+        LogicalExpr::Comparison(comparison) => {
+            comparable_paths(&comparison.left, paths) && comparable_paths(&comparison.right, paths)
+        }
+        LogicalExpr::Existence(test) => match test {
+            ExistenceTest::Singular(query) => singular_leaf_path(query, paths),
+            ExistenceTest::General(_) => false,
+        },
+        #[cfg(feature = "regex")]
+        LogicalExpr::Test(function) => function_paths(function, paths),
+    }
+}
+
+fn comparable_paths(comparable: &Comparable, paths: &mut Vec<Vec<String>>) -> bool {
+    match comparable {
+        Comparable::Literal(_) => true,
+        Comparable::Singular(query) => singular_leaf_path(query, paths),
+        Comparable::Function(function) => function_paths(function, paths),
+    }
+}
+
+fn function_paths(function: &Function, paths: &mut Vec<Vec<String>>) -> bool {
+    match function {
+        Function::Length(arg) => value_arg_paths(arg, paths),
+        // `count`/`value` take general (non-singular) sub-queries: not pushable.
+        Function::Count(_) | Function::Value(_) => false,
+        #[cfg(feature = "regex")]
+        Function::Match(arg, pattern) | Function::Search(arg, pattern) => {
+            value_arg_paths(arg, paths) && pattern_paths(pattern, paths)
+        }
+    }
+}
+
+#[cfg(feature = "regex")]
+fn pattern_paths(pattern: &Pattern, paths: &mut Vec<Vec<String>>) -> bool {
+    match pattern {
+        Pattern::Literal(_) => true,
+        Pattern::Dynamic(arg) => value_arg_paths(arg, paths),
+    }
+}
+
+fn value_arg_paths(arg: &ValueArg, paths: &mut Vec<Vec<String>>) -> bool {
+    match arg {
+        ValueArg::Literal(_) => true,
+        ValueArg::Singular(query) => singular_leaf_path(query, paths),
+        ValueArg::Function(function) => function_paths(function, paths),
+    }
+}
+
+/// Records a singular query as a leaf path, or rejects pushdown: `$`-rooted queries
+/// resolve outside the candidate; index steps cannot be expressed in the synthetic
+/// fragment without inventing sparse-array members (false existence); unscannable
+/// names cannot be byte-matched; and a bare `@` (empty path) would make the leaf scan
+/// re-extract every candidate — exactly what pushdown exists to avoid.
+fn singular_leaf_path(query: &ast::SingularQuery, paths: &mut Vec<Vec<String>>) -> bool {
+    if matches!(query.root, ast::QueryRoot::Root) || query.segments.is_empty() {
+        return false;
+    }
+    let mut path = Vec::with_capacity(query.segments.len());
+    for segment in &query.segments {
+        match segment {
+            ast::SingularSegment::Name(name) => {
+                if !name_scans_verbatim(name) {
+                    return false;
+                }
+                path.push(name.clone());
+            }
+            ast::SingularSegment::Index(_) => return false,
+        }
+    }
+    paths.push(path);
+    true
 }
 
 /// A single-wildcard segment (`[*]` or `..*`) — as the *entire* prefix it selects every
@@ -163,6 +339,26 @@ fn render_prefix(
     prefix: &[Segment],
     child_wildcard_tail: bool,
 ) -> Option<rsonpath_syntax::JsonPathQuery> {
+    let mut builder = prefix_builder(prefix)?;
+    if child_wildcard_tail {
+        builder.child_wildcard();
+    }
+    Some(builder.to_query())
+}
+
+/// Renders a pushdown leaf query: the prefix, the filter's `[*]`, then the leaf's
+/// member-name steps.
+fn render_leaf(prefix: &[Segment], path: &[String]) -> Option<rsonpath_syntax::JsonPathQuery> {
+    let mut builder = prefix_builder(prefix)?;
+    builder.child_wildcard();
+    for name in path {
+        builder.child_name(name.as_str());
+    }
+    Some(builder.to_query())
+}
+
+/// The shared builder walk over prefix segments.
+fn prefix_builder(prefix: &[Segment]) -> Option<rsonpath_syntax::builder::JsonPathQueryBuilder> {
     let mut builder = rsonpath_syntax::builder::JsonPathQueryBuilder::new();
     for segment in prefix {
         let descendant = matches!(segment, Segment::Descendant(_));
@@ -196,10 +392,7 @@ fn render_prefix(
             Selector::Slice(_) | Selector::Filter(_) => return None,
         }
     }
-    if child_wildcard_tail {
-        builder.child_wildcard();
-    }
-    Some(builder.to_query())
+    Some(builder)
 }
 
 // The `$`-reference check: one function per IR layer that can embed a sub-query. Every
@@ -292,13 +485,30 @@ mod tests {
     use super::{Plan, split};
     use crate::JsonPath;
 
-    /// The split decision for `query`, reduced to what the tests assert on:
-    /// `Some((has_predicate, residual_len))` when it scans, `None` for [`Plan::Dom`].
-    fn decision(query: &str) -> Option<(bool, usize)> {
+    /// The split decision for `query`, reduced to what the tests assert on.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Kind {
+        /// Plain fragment scan: `(has_predicate, residual_len)`.
+        Scan(bool, usize),
+        /// Filter pushdown: `(leaf_count, residual_len)`.
+        Pushdown(usize, usize),
+        Dom,
+    }
+
+    fn kind(query: &str) -> Kind {
         let path = JsonPath::parse(query).expect("test query must compile");
         match split(path.compiled()) {
-            Plan::Scan(plan) => Some((plan.predicate.is_some(), plan.residual.len())),
-            Plan::Dom => None,
+            Plan::Scan(plan) => Kind::Scan(plan.predicate.is_some(), plan.residual.len()),
+            Plan::Pushdown(plan) => Kind::Pushdown(plan.leaves.len(), plan.residual.len()),
+            Plan::Dom => Kind::Dom,
+        }
+    }
+
+    /// Back-compat shape for the plain-scan assertions below.
+    fn decision(query: &str) -> Option<(bool, usize)> {
+        match kind(query) {
+            Kind::Scan(predicate, residual) => Some((predicate, residual)),
+            Kind::Pushdown(..) | Kind::Dom => None,
         }
     }
 
@@ -314,31 +524,75 @@ mod tests {
     }
 
     #[test]
-    fn trailing_filter_becomes_the_predicate() {
+    fn pushable_filters_take_the_pushdown_plan() {
         assert_eq!(
-            decision("$.store.book[?@.price < 10]"),
-            Some((true, 0)),
-            "a trailing filter cuts into a predicate with nothing left over"
+            kind("$.store.book[?@.price < 10]"),
+            Kind::Pushdown(1, 0),
+            "a singular-comparison filter pushes down with one leaf scan"
         );
         assert_eq!(
-            decision("$.store.book[?@.p].title"),
-            Some((true, 1)),
-            "segments after the filter stay in the residual"
+            kind("$.store.book[?@.p].title"),
+            Kind::Pushdown(1, 1),
+            "segments after the pushed filter stay in the residual"
         );
         assert_eq!(
-            decision("$[?@.x]"),
-            Some((true, 0)),
-            "a root-level filter scans as `$[*]` plus a predicate"
+            kind("$[?@.x]"),
+            Kind::Pushdown(1, 0),
+            "a root-level filter pushes down: only passing root children are parsed"
         );
         assert_eq!(
-            decision("$.a[?@.b][?@.c]"),
-            Some((true, 1)),
-            "only the first filter becomes the predicate; the second stays residual"
+            kind("$.a[?@.b][?@.c]"),
+            Kind::Pushdown(1, 1),
+            "only the first filter pushes down; the second stays residual"
         );
         assert_eq!(
-            decision("$.a[?@.b][2]"),
-            Some((true, 1)),
-            "an index after the filter applies to each filtered node, in the residual"
+            kind("$.a[?@.b][2]"),
+            Kind::Pushdown(1, 1),
+            "an index after the filter applies to each passing node, in the residual"
+        );
+        assert_eq!(
+            kind("$.a[?@.b && @.c.d]"),
+            Kind::Pushdown(2, 0),
+            "each distinct singular path becomes one leaf scan"
+        );
+        assert_eq!(
+            kind("$.a[?@.b < 3 || @.b > 7]"),
+            Kind::Pushdown(1, 0),
+            "a path referenced twice is scanned once"
+        );
+    }
+
+    #[test]
+    fn unpushable_filters_fall_back_to_the_fragment_scan() {
+        assert_eq!(
+            kind("$.a[?@.b[*]]"),
+            Kind::Scan(true, 0),
+            "a general (non-singular) existence test needs the real fragment"
+        );
+        assert_eq!(
+            kind("$..a[?@.x]"),
+            Kind::Scan(true, 0),
+            "a descendant prefix nests candidates: span alignment would be ambiguous"
+        );
+        assert_eq!(
+            kind("$.a[?@[0] == 1]"),
+            Kind::Scan(true, 0),
+            "an index leaf cannot be expressed in the synthetic fragment"
+        );
+        assert_eq!(
+            kind("$.a[?@ > 1]"),
+            Kind::Scan(true, 0),
+            "a bare `@` leaf would re-extract every candidate — no gain over the scan"
+        );
+        assert_eq!(
+            kind("$.a[?count(@.b[*]) == 1]"),
+            Kind::Scan(true, 0),
+            "count() takes a general sub-query: not pushable"
+        );
+        assert_eq!(
+            kind(r#"$.a[?@['b"c']]"#),
+            Kind::Scan(true, 0),
+            "an escape-requiring leaf name cannot be byte-matched"
         );
     }
 
@@ -350,8 +604,8 @@ mod tests {
             "a slice after a scannable step lands in the residual"
         );
         assert_eq!(
-            decision("$[1:2]"),
-            None,
+            kind("$[1:2]"),
+            Kind::Dom,
             "a root-level slice leaves a bare-`$` prefix: not worth scanning"
         );
     }
@@ -364,8 +618,8 @@ mod tests {
             "a descendant filter is never converted to a predicate, but scans after a prefix"
         );
         assert_eq!(
-            decision("$..[?@.a]"),
-            None,
+            kind("$..[?@.a]"),
+            Kind::Dom,
             "a root-level descendant filter leaves a bare-`$` prefix"
         );
     }
@@ -380,8 +634,8 @@ mod tests {
             "$.a[?length($.b) == 1]",
         ] {
             assert_eq!(
-                decision(query),
-                None,
+                kind(query),
+                Kind::Dom,
                 "`{query}` references `$` past the cut and must fall back to DOM"
             );
         }
@@ -391,14 +645,14 @@ mod tests {
     #[test]
     fn root_references_inside_regex_functions_force_dom() {
         assert_eq!(
-            decision(r"$.a[?match(@.name, $.pattern)]"),
-            None,
+            kind(r"$.a[?match(@.name, $.pattern)]"),
+            Kind::Dom,
             "a dynamic pattern computed from `$` must fall back to DOM"
         );
         assert_eq!(
-            decision(r#"$.a[?search(@.name, "ada")]"#),
-            Some((true, 0)),
-            "a literal pattern embeds no query and scans fine"
+            kind(r#"$.a[?search(@.name, "ada")]"#),
+            Kind::Pushdown(1, 0),
+            "a literal pattern embeds no query: the string leaf pushes down"
         );
     }
 
@@ -406,8 +660,8 @@ mod tests {
     fn inexpressible_shapes_fall_back_to_dom() {
         for query in ["$", "$[-1]", "$['a','b']", r#"$['a"b']"#] {
             assert_eq!(
-                decision(query),
-                None,
+                kind(query),
+                Kind::Dom,
                 "`{query}` has no useful byte-scannable prefix"
             );
         }
@@ -438,8 +692,8 @@ mod tests {
             "the plain prefix scans; the escape-requiring name and its tail are residual"
         );
         assert_eq!(
-            decision(r"$['c\\d']"),
-            None,
+            kind(r"$['c\\d']"),
+            Kind::Dom,
             "an escape-requiring name at the root leaves a bare-`$` prefix"
         );
     }
@@ -450,13 +704,13 @@ mod tests {
             let path = JsonPath::parse(query).expect("test query must compile");
             match split(path.compiled()) {
                 Plan::Scan(plan) => Some(plan.whole_document),
-                Plan::Dom => None,
+                Plan::Pushdown(_) | Plan::Dom => None,
             }
         };
         assert_eq!(
-            whole("$[?@.x]"),
+            whole("$[?count(@.x[*]) > 0]"),
             Some(true),
-            "a root-level filter renders to `$[*]`: fragments cover the whole document"
+            "an unpushable root-level filter renders to `$[*]`: fragments cover the whole document"
         );
         assert_eq!(whole("$[*]"), Some(true), "`$[*]` selects every root child");
         assert_eq!(whole("$..*"), Some(true), "`$..*` selects every node");
@@ -466,7 +720,7 @@ mod tests {
             "a wildcard followed by a name narrows: fragment size is data-dependent"
         );
         assert_eq!(
-            whole("$.store.book[?@.p]"),
+            whole("$.store.book[?@.p[*]]"),
             Some(false),
             "a named prefix is data-dependent, never statically whole-document"
         );
