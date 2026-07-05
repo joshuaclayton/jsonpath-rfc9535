@@ -112,6 +112,17 @@ const CASES: &[Case] = &[
         goessner: Some("$.store.book[?(@.price < 10)]"),
         rsonpath: None,
     },
+    // A filter behind a *selective* structural prefix: `$.store.book[0].reviews[*]`
+    // narrows to a handful of nodes before the predicate runs, where `filter_cheap`'s
+    // `book[*]` spans essentially every byte of the document. The pair brackets the two
+    // extremes of how much data the structural part of a filter query touches — a shape
+    // no case covered before.
+    Case {
+        label: "filter_selective",
+        rfc: "$.store.book[0].reviews[?@.rating >= 4]",
+        goessner: Some("$.store.book[0].reviews[?(@.rating >= 4)]"),
+        rsonpath: None,
+    },
     // `search()` is an RFC 9535 function extension; jsonpath_lib has no regex, so this
     // case compares jsonpath-rfc9535 against jsonpath-rust only.
     Case {
