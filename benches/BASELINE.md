@@ -214,3 +214,60 @@ the `is_container` prune already taking −56% off `$..price` paths, the remaini
 is ~10–20% on that one query shape, at the cost of a new `Trail` trait + associated type
 and loss of prefix-sharing across matches; not pursued.
 
+
+## Update 2026-07-04 — the `scan` feature: hybrid byte-scanning over raw text
+
+New `extract/` rows for `ScanQuery` (feature `scan`): rsonpath byte-scans the query's
+structural prefix; filters run per extracted fragment, or — when the predicate only
+consults singular `@`-rooted member paths — are *pushed down* into auxiliary scans so
+only passing candidates are ever parsed. Full criterion sampling (not `--quick`),
+Apple M4 Pro, rustc 1.92.0, rsonpath-lib 0.10.1 (scalar path on aarch64 — SIMD
+acceleration is x86-only, so these ratios understate x86 results).
+
+Context for the ratios: in `extract/` (text → usable values) the DOM engines were
+tied (~1.0×) — a whole-document `serde_json` parse dominates both identically. The
+hybrid's entire margin is new capability, not an increment: it never builds the DOM.
+`eval/` (query a `Value` you already hold) is untouched by the feature and remains the
+headline metric for compile-once/query-many use; an A/B against a pre-scan baseline
+showed no change on any existing row.
+
+### 1k
+
+| case | parse+query | jsonpath_lib | raw rsonpath | hybrid (adaptive) | hybrid vs parse+query |
+|---|---|---|---|---|---|
+| child | 1.04 ms | 1.05 ms | 45.5 µs | 46.0 µs | **22.7× faster** |
+| author_wildcard | 1.07 ms | 1.07 ms | 175.5 µs | 177.8 µs | **6.0× faster** |
+| descendant_price | 1.10 ms | 1.12 ms | 125.1 µs | 119.0 µs | **9.2× faster** |
+| nested_wildcard | 1.09 ms | 1.10 ms | 218.0 µs | 221.2 µs | **4.9× faster** |
+| filter_cheap | 1.08 ms | 1.12 ms | — | 629.5 µs | **1.7× faster** |
+| filter_selective | 1.06 ms | 1.07 ms | — | 45.3 µs | **23.4× faster** |
+| filter_search | 1.09 ms | — | — | 536.4 µs | **2.0× faster** |
+
+### 100k
+
+| case | parse+query | jsonpath_lib | raw rsonpath | hybrid (adaptive) | hybrid vs parse+query |
+|---|---|---|---|---|---|
+| child | 114.84 ms | 115.39 ms | 4.56 ms | 4.62 ms | **24.9× faster** |
+| author_wildcard | 120.37 ms | 119.58 ms | 18.27 ms | 18.55 ms | **6.5× faster** |
+| descendant_price | 124.37 ms | 124.89 ms | 13.15 ms | 12.72 ms | **9.8× faster** |
+| nested_wildcard | 126.77 ms | 127.87 ms | 24.32 ms | 24.29 ms | **5.2× faster** |
+| filter_cheap | 120.04 ms | 126.36 ms | — | 62.87 ms | **1.9× faster** |
+| filter_selective | 112.74 ms | 112.67 ms | — | 4.50 ms | **25.0× faster** |
+| filter_search | 125.24 ms | — | — | 55.32 ms | **2.3× faster** |
+
+Reading the table:
+
+* **Structural queries ride the byte engine at cost parity**: the hybrid matches raw
+  rsonpath within ~1-2% everywhere both can run — the residual machinery is free.
+* **Filter queries are the new capability** (raw rsonpath cannot express them at all).
+  With a selective prefix (`filter_selective`) the hybrid behaves like a structural
+  query: ~25×. With a whole-document candidate set (`filter_cheap`, `filter_search`),
+  pushdown decides the predicate from leaf scans and parses only passing candidates:
+  ~2× where the pre-pushdown fragment scan *lost* to DOM by ~10%.
+* **The forced-scan rows (not shown) equal adaptive within noise** on every case:
+  adaptive's routing (whole-document prefixes → DOM, overlap budget, pushdown finish
+  selection) costs nothing on flat documents; its value is bounding the tails.
+
+Remaining known losses: none in `extract/`. The pathological shapes (self-nested
+documents under descendant prefixes, duplicate member names) degrade or diverge as
+documented on `ScanQuery::query_values`.

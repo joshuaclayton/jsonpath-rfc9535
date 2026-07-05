@@ -20,10 +20,14 @@ jobs:
             target: test-lint
           - name: Clippy (no default features)
             target: test-lint-no-default
+          - name: Clippy (scan feature)
+            target: test-lint-scan
           - name: Test Suite
             target: test
           - name: Test Suite (no default features)
             target: test-no-default
+          - name: Test Suite (scan feature)
+            target: test-scan
           - name: Docs
             target: test-doc
           - name: Doc Links
