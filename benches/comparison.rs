@@ -37,7 +37,7 @@
 //! so a non-equivalent query fails loudly rather than comparing apples to oranges.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use jsonpath_rfc9535::JsonPath as JpFull;
+use jsonpath_rfc9535::{JsonPath as JpFull, ScanMode, ScanQuery};
 use jsonpath_rust::JsonPath as _;
 use rsonpath::engine::{Compiler, Engine, RsonpathEngine};
 use rsonpath::input::BorrowedBytes;
@@ -313,20 +313,24 @@ fn bench_scan(c: &mut Criterion) {
 /// node's JSON text, and we parse every fragment back into an owned `Value`. `rsonpath`
 /// still skips building a whole-document DOM, so it is expected to stay ahead — just by a
 /// smaller, more honest margin than `scan/`, which lets it stop at a bare count.
+///
+/// This group also runs jsonpath-rfc9535's own **hybrid scan** (`ScanQuery`, the `scan`
+/// feature): rsonpath extracts the structural prefix, the residual (filters included)
+/// runs per fragment. Unlike raw `rsonpath` it covers *every* case — the filter cases
+/// raw `rsonpath` cannot express are exactly where the hybrid earns its keep.
 fn bench_extract(c: &mut Criterion) {
     for (size, text) in fixture_texts() {
         let Ok(document) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
         for case in CASES {
-            let Some(query) = case.rsonpath else {
-                continue;
-            };
-            let Some(engine) = rsonpath_engine(query) else {
-                continue;
-            };
-            // Cross-check the extracted match count against jsonpath-rfc9535 before benching.
-            if let Some(values) = extract_rsonpath(&engine, &text) {
+            // Raw rsonpath only covers the cases it can express; the hybrid and DOM
+            // rows run for every case.
+            let raw_engine = case.rsonpath.and_then(rsonpath_engine);
+            // Cross-check both byte pipelines against jsonpath-rfc9535 before benching.
+            if let Some(engine) = &raw_engine
+                && let Some(values) = extract_rsonpath(engine, &text)
+            {
                 let jp = count_jsonpath_rfc9535(&document, case.rfc);
                 assert_eq!(
                     jp,
@@ -335,6 +339,33 @@ fn bench_extract(c: &mut Criterion) {
                     case.label,
                     values.len()
                 );
+            }
+            // Two hybrid rows: the default adaptive mode (decides per document) and
+            // forced scan (always the byte engine) — their gap is what the adaptive
+            // heuristic buys or costs on each case.
+            let hybrid = ScanQuery::parse(case.rfc)
+                .ok()
+                .map(|adaptive| (adaptive.clone(), adaptive.with_mode(ScanMode::Scan)));
+            if let Some((adaptive, forced)) = &hybrid {
+                assert!(
+                    forced.uses_scan(),
+                    "`{}` unexpectedly fell back to DOM mode — the hybrid rows would not \
+                     measure byte scanning",
+                    case.label
+                );
+                let jp = count_jsonpath_rfc9535(&document, case.rfc);
+                for (mode, query) in [("adaptive", adaptive), ("scan", forced)] {
+                    let extracted = query
+                        .query_values(&text)
+                        .map(|values| values.len())
+                        .map_err(|error| error.to_string());
+                    assert_eq!(
+                        extracted,
+                        Ok(jp),
+                        "jsonpath-rfc9535 vs hybrid ({mode}) disagree on `{}` over {size}",
+                        case.label
+                    );
+                }
             }
 
             let mut group = c.benchmark_group(format!("extract/{size}/{}", case.label));
@@ -355,9 +386,19 @@ fn bench_extract(c: &mut Criterion) {
                     });
                 });
             }
-            group.bench_function("rsonpath (matches+parse)", |b| {
-                b.iter(|| extract_rsonpath(&engine, black_box(&text)));
-            });
+            if let Some(engine) = &raw_engine {
+                group.bench_function("rsonpath (matches+parse)", |b| {
+                    b.iter(|| extract_rsonpath(engine, black_box(&text)));
+                });
+            }
+            if let Some((adaptive, forced)) = &hybrid {
+                group.bench_function("jsonpath-rfc9535 (hybrid adaptive)", |b| {
+                    b.iter(|| adaptive.query_values(black_box(&text)));
+                });
+                group.bench_function("jsonpath-rfc9535 (hybrid scan)", |b| {
+                    b.iter(|| forced.query_values(black_box(&text)));
+                });
+            }
             group.finish();
         }
     }
