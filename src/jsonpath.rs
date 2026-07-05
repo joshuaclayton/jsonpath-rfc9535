@@ -71,8 +71,9 @@ impl JsonPath {
         )
     }
 
-    /// Returns the compiled query IR (consumed by the evaluator).
-    const fn compiled(&self) -> &Query {
+    /// Returns the compiled query IR (consumed by the evaluator, and by the `scan`
+    /// splitter).
+    pub(crate) const fn compiled(&self) -> &Query {
         &self.query
     }
 }
