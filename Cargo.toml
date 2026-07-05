@@ -14,6 +14,11 @@ exclude = ["/benches"]
 [dependencies]
 nom = "^8"
 regex = { version = "1.12.4", optional = true }
+# `scan` only. NOTE: rsonpath-lib 0.10.1 declares rust-version 1.89, above this
+# crate's 1.88 — a publish-time decision (bump vs document) deferred while `scan`
+# is a spike.
+rsonpath-lib = { version = "0.10", optional = true }
+rsonpath-syntax = { version = "0.4", optional = true }
 serde_json = "1.0.150"
 
 [lints.rust]
@@ -58,18 +63,22 @@ default = ["regex"]
 # I-Regexp (RFC 9485) engine backed by the `regex` crate. Without this feature a
 # query that uses `match()`/`search()` is rejected by `JsonPath::parse`.
 regex = ["dep:regex"]
+# Hybrid byte-scanning evaluation over raw JSON text (`ScanQuery`): an rsonpath
+# engine extracts a structural query prefix from the raw bytes and the residual
+# (filters, tail segments) is evaluated per extracted fragment — no whole-document
+# DOM. Experimental; off by default.
+scan = ["dep:rsonpath-lib", "dep:rsonpath-syntax"]
 # Gates the cross-library comparison bench (`benches/comparison.rs`). Pulls in `regex`
-# so the `search()` case works even under `--no-default-features`. Not part of the
-# published API; enable only to run `cargo bench --features compare`.
-compare = ["regex"]
+# so the `search()` case works even under `--no-default-features`, and `scan` for the
+# hybrid rows. Not part of the published API; enable only to run
+# `cargo bench --features compare`.
+compare = ["regex", "scan"]
 
 [dev-dependencies]
 criterion = "0.8.2"
 jsonpath-rust = "1.0.4"
 jsonpath_lib = "0.3.0"
 proptest = "1.11.0"
-rsonpath-lib = "0.10"
-rsonpath-syntax = "0.4"
 serde = { version = "1.0.228", features = ["derive"] }
 
 [[bin]]

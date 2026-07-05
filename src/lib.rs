@@ -85,6 +85,12 @@
 //! # Ok::<(), jsonpath_rfc9535::Error>(())
 //! ```
 //!
+//! * **`scan`** *(experimental, off by default)* — provides `ScanQuery`: hybrid
+//!   evaluation over **raw JSON text** that byte-scans a structural query prefix
+//!   (via [rsonpath](https://docs.rs/rsonpath-lib)) and evaluates the residual per
+//!   extracted fragment, never building a whole-document DOM. See the type's docs for
+//!   semantics and caveats.
+//!
 //! # Conformance
 //!
 //! Correctness is pinned to the official [JSONPath Compliance Test Suite][cts]: every
@@ -107,11 +113,16 @@ mod jsonpath;
 mod node;
 mod normalized_path;
 mod parser;
+#[cfg(feature = "scan")]
+mod scan;
 
 pub use error::Error;
 pub use jsonpath::JsonPath;
 pub use node::{LocatedNode, NodeList};
 pub use normalized_path::NormalizedPath;
+#[cfg(feature = "scan")]
+#[cfg_attr(docsrs, doc(cfg(feature = "scan")))]
+pub use scan::{ScanError, ScanMode, ScanQuery};
 
 /// Compiles `path` and evaluates it against `root` in a single step.
 ///

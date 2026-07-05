@@ -79,6 +79,18 @@ pub fn evaluate_values<'a>(query: &Query, root: &'a Value) -> Vec<&'a Value> {
         .collect()
 }
 
+/// Seam for the `scan` hybrid evaluator: threads `segments` from `start` (an extracted
+/// fragment), carrying `root` for absolute filter sub-queries, and returns just the
+/// selected values in order — no path tracking. Kept as a wrapper so [`Position`] and
+/// [`NoPath`] stay private to this module.
+#[cfg(feature = "scan")]
+pub fn walk_values<'a>(segments: &[Segment], start: &'a Value, root: &'a Value) -> Vec<&'a Value> {
+    walk(segments, NoPath, start, root)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
 // A query whose every segment is a single child name/index step selects at most one
 // node, so it needs neither a worklist nor any per-segment `Vec`: a single `&Value` is
 // threaded down the document. `JsonPath` precomputes this form (see
@@ -426,7 +438,9 @@ fn eval_filter_query<'a>(
     walk(&query.segments, NoPath, start, root)
 }
 
-fn eval_logical<'a>(expr: &LogicalExpr, current: &'a Value, root: &'a Value) -> bool {
+/// Evaluates a filter's logical expression against a candidate node. Also serves as the
+/// `scan` hybrid evaluator's per-fragment predicate.
+pub fn eval_logical<'a>(expr: &LogicalExpr, current: &'a Value, root: &'a Value) -> bool {
     match expr {
         LogicalExpr::Or(left, right) => {
             eval_logical(left, current, root) || eval_logical(right, current, root)
