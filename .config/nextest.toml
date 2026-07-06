@@ -1,0 +1,6 @@
+# Turn a hanging test into a failure instead of a stuck CI job: after `period` a test
+# is flagged slow; after `terminate-after` periods it is killed and failed. The scan
+# feature's malformed-input contract ("terminates, no panic") relies on this to be
+# enforceable — without it, non-termination blocks CI rather than failing a test.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }

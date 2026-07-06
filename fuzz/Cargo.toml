@@ -1,0 +1,25 @@
+[package]
+name = "jsonpath-rfc9535-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+jsonpath-rfc9535 = { features = ["scan"], path = ".." }
+libfuzzer-sys = "0.4"
+# `preserve_order` keeps a parse→serialize round-trip byte-identical for canonical
+# inputs, which is what gates the differential assertion in the fuzz target.
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+
+[[bin]]
+name = "scan_differential"
+path = "fuzz_targets/scan_differential.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from any future parent workspace; cargo-fuzz expects to own this crate.
+[workspace]
