@@ -12,7 +12,7 @@
 //! `preserve_order`). So a case must match **exactly**, unless its selector contains
 //! `..`, where a multiset match is accepted instead.
 //!
-//! Each case runs twice: once in **forced [`ScanMode::Scan`]** — the suite's documents
+//! Each case runs twice: once in **forced [`ScanMode::AlwaysScan`]** — the suite's documents
 //! are tiny, so the adaptive fragment-byte budget would demote most of them to DOM and
 //! the byte pipeline would go untested — and once in the default **adaptive** mode,
 //! which pins the static routing and mid-scan fallback to the same answers.
@@ -110,7 +110,7 @@ fn scan_agrees_with_dom_on_every_compliance_case() {
 fn run_case(case: &Case) -> Result<bool, String> {
     let forced = ScanQuery::parse(&case.selector)
         .map_err(|error| format!("expected a valid selector, got: {error}"))?
-        .with_mode(ScanMode::Scan);
+        .with_mode(ScanMode::AlwaysScan);
     let adaptive = forced.clone().with_mode(ScanMode::Adaptive);
     let dom_query = JsonPath::parse(&case.selector)
         .map_err(|error| format!("expected a valid selector, got: {error}"))?;

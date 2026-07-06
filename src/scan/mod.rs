@@ -56,14 +56,14 @@ pub enum ScanMode {
     /// (fragments at, say, 90% of the document): measured on real documents, bailing
     /// mid-scan and re-parsing costs more than just finishing, and the finished scan
     /// trails a plain DOM parse by only ~10-20%. When you know your prefix spans the
-    /// bulk of every document, say so with [`ScanMode::Dom`].
+    /// bulk of every document, say so with [`ScanMode::NeverScan`].
     #[default]
     Adaptive,
     /// Always byte-scan when the query splits, however non-selective the prefix turns
     /// out to be on a given document.
-    Scan,
-    /// Always parse the whole document and evaluate normally — byte-scanning off.
-    Dom,
+    AlwaysScan,
+    /// Never byte-scan: always parse the whole document and evaluate normally.
+    NeverScan,
 }
 
 /// A compiled JSONPath query that evaluates against **raw JSON text**.
@@ -169,7 +169,7 @@ impl ScanQuery {
     /// * **Pathological nesting.** Under a descendant prefix, self-nested structures
     ///   are extracted once per nesting level, so total fragment bytes can exceed the
     ///   document size. [`ScanMode::Adaptive`] (the default) detects this mid-scan and
-    ///   falls back to a whole-document parse; [`ScanMode::Scan`] pays the full cost.
+    ///   falls back to a whole-document parse; [`ScanMode::AlwaysScan`] pays the full cost.
     ///
     /// # Errors
     ///
@@ -178,27 +178,34 @@ impl ScanQuery {
     /// [`ScanError::Engine`] when the byte engine fails (detected malformed input,
     /// depth above its limit).
     pub fn query_values(&self, json_text: &str) -> Result<Vec<Value>, ScanError> {
+        match self.route() {
+            Route::Dom => self.run_dom(json_text),
+            Route::Pushdown(plan) => run_pushdown(plan, json_text),
+            Route::Scan(plan) => run_scan(plan, json_text),
+            Route::BudgetedScan(plan) => match run_scan_within_budget(plan, json_text) {
+                BudgetOutcome::Done(result) => result,
+                BudgetOutcome::Exceeded => self.run_dom(json_text),
+            },
+        }
+    }
+
+    /// Resolves this query's `(plan, mode)` pair to the pipeline an evaluation takes
+    /// — the one place the strategy decision is made.
+    /// [`query_values`](Self::query_values) dispatches on it;
+    /// [`uses_scan`](Self::uses_scan) reports it.
+    fn route(&self) -> Route<'_> {
         match (&self.plan, self.mode) {
-            (Plan::Dom, _) | (Plan::Scan(_) | Plan::Pushdown(_), ScanMode::Dom) => {
-                self.run_dom(json_text)
-            }
+            (Plan::Dom, _) | (Plan::Scan(_) | Plan::Pushdown(_), ScanMode::NeverScan) => Route::Dom,
             // Pushdown needs no adaptive budget: candidates are disjoint (child-only
             // prefix), leaf values are scalars-or-small, and candidate bytes are only
             // touched for candidates that pass — every cost is bounded by the input.
-            (Plan::Pushdown(plan), ScanMode::Scan | ScanMode::Adaptive) => {
-                run_pushdown(plan, json_text)
+            (Plan::Pushdown(plan), ScanMode::AlwaysScan | ScanMode::Adaptive) => {
+                Route::Pushdown(plan)
             }
-            (Plan::Scan(plan), ScanMode::Scan) => run_scan(plan, json_text),
-            (Plan::Scan(plan), ScanMode::Adaptive) => {
-                if plan.whole_document {
-                    // Provably non-selective for any document: don't touch the bytes.
-                    return self.run_dom(json_text);
-                }
-                match run_scan_within_budget(plan, json_text) {
-                    BudgetOutcome::Done(result) => result,
-                    BudgetOutcome::Exceeded => self.run_dom(json_text),
-                }
-            }
+            (Plan::Scan(plan), ScanMode::AlwaysScan) => Route::Scan(plan),
+            // Provably non-selective for any document: don't touch the bytes.
+            (Plan::Scan(plan), ScanMode::Adaptive) if plan.whole_document => Route::Dom,
+            (Plan::Scan(plan), ScanMode::Adaptive) => Route::BudgetedScan(plan),
         }
     }
 
@@ -216,19 +223,30 @@ impl ScanQuery {
     }
 
     /// Whether evaluation will reach for the byte-scanning engine at all. `false` when
-    /// the query cannot split, when the mode is [`ScanMode::Dom`], or when the mode is
+    /// the query cannot split, when the mode is [`ScanMode::NeverScan`], or when the mode is
     /// [`ScanMode::Adaptive`] and the prefix provably covers the whole document. Under
     /// [`ScanMode::Adaptive`] a `true` still means *attempts*: a non-selective document
     /// can make an individual evaluation fall back mid-scan.
     #[must_use]
     pub fn uses_scan(&self) -> bool {
-        match (&self.plan, self.mode) {
-            (Plan::Dom, _) | (Plan::Scan(_) | Plan::Pushdown(_), ScanMode::Dom) => false,
-            (Plan::Scan(plan), ScanMode::Adaptive) => !plan.whole_document,
-            (Plan::Scan(_), ScanMode::Scan)
-            | (Plan::Pushdown(_), ScanMode::Scan | ScanMode::Adaptive) => true,
-        }
+        !matches!(self.route(), Route::Dom)
     }
+}
+
+/// The pipeline a [`ScanQuery`]'s `(plan, mode)` pair resolves to for one evaluation.
+/// Computed in exactly one place ([`ScanQuery::route`]) so dispatch
+/// ([`ScanQuery::query_values`]) and introspection ([`ScanQuery::uses_scan`]) cannot
+/// drift apart.
+enum Route<'a> {
+    /// Parse the whole document and evaluate normally: unsplittable plan, forced DOM
+    /// mode, or an adaptive prefix that provably covers any document.
+    Dom,
+    /// Unbudgeted byte scan ([`ScanMode::AlwaysScan`]).
+    Scan(&'a ScanPlan),
+    /// Byte scan under the adaptive fragment-byte budget; DOM fallback on overflow.
+    BudgetedScan(&'a ScanPlan),
+    /// Filter pushdown: auxiliary leaf scans decide the predicate first.
+    Pushdown(&'a PushdownPlan),
 }
 
 impl FromStr for ScanQuery {
@@ -239,7 +257,7 @@ impl FromStr for ScanQuery {
     }
 }
 
-/// The unbudgeted scan pipeline ([`ScanMode::Scan`]): extract every prefix-matched
+/// The unbudgeted scan pipeline ([`ScanMode::AlwaysScan`]): extract every prefix-matched
 /// fragment, then run the per-fragment residual.
 fn run_scan(plan: &ScanPlan, json_text: &str) -> Result<Vec<Value>, ScanError> {
     let mut matches: Vec<Match> = Vec::new();
@@ -341,18 +359,42 @@ fn run_pushdown(plan: &PushdownPlan, json_text: &str) -> Result<Vec<Value>, Scan
         .approximate_spans(&input, &mut candidate_spans)
         .map_err(engine_error)?;
 
-    // The span pass just measured the candidate set exactly, so pick the cheaper
-    // finish: a small candidate set is cheaper to parse outright than to run k more
-    // whole-document leaf scans over; a large one is worth the leaf scans to avoid
-    // parsing candidates the filter will drop. The 32:1 factor understates the
-    // measured parse:scan cost per byte, so the direct route is only taken when it
-    // clearly wins.
     let candidate_bytes: usize = candidate_spans.iter().map(MatchSpan::len).sum();
-    let leaf_scan_equivalent = json_text.len().saturating_mul(plan.leaves.len().max(1));
-    if candidate_bytes.saturating_mul(32) <= leaf_scan_equivalent {
-        return finish_by_parsing_candidates(plan, json_text, &candidate_spans);
+    match choose_finish(candidate_bytes, json_text.len(), plan.leaves.len()) {
+        PushdownFinish::ParseCandidates => {
+            finish_by_parsing_candidates(plan, json_text, &candidate_spans)
+        }
+        PushdownFinish::LeafScans => finish_by_leaf_scans(plan, json_text, &input, candidate_spans),
     }
-    finish_by_leaf_scans(plan, json_text, &input, candidate_spans)
+}
+
+/// Measured cost of parsing one byte of JSON into a [`Value`], in units of
+/// byte-scanning that byte. Deliberately *understates* the measured ratio so
+/// [`PushdownFinish::ParseCandidates`] is chosen only when it clearly wins.
+const PARSE_TO_SCAN_COST_RATIO: usize = 32;
+
+/// How a pushdown run finishes once the span pass has measured the candidate set.
+/// Chosen by [`choose_finish`].
+enum PushdownFinish {
+    /// Parse every candidate outright and judge the real fragments: cheaper when the
+    /// candidates are a sliver of the input.
+    ParseCandidates,
+    /// Extract the predicate's leaf values with auxiliary scans and parse only the
+    /// passing candidates: cheaper when the candidates span most of the input.
+    LeafScans,
+}
+
+/// The pushdown cost model: compares parsing all candidates
+/// (`candidate_bytes × PARSE_TO_SCAN_COST_RATIO` scan-units) against deciding the
+/// predicate from auxiliary scans (one whole-input scan per leaf), and picks the
+/// cheaper finish.
+fn choose_finish(candidate_bytes: usize, input_len: usize, leaf_count: usize) -> PushdownFinish {
+    let leaf_scan_equivalent = input_len.saturating_mul(leaf_count.max(1));
+    if candidate_bytes.saturating_mul(PARSE_TO_SCAN_COST_RATIO) <= leaf_scan_equivalent {
+        PushdownFinish::ParseCandidates
+    } else {
+        PushdownFinish::LeafScans
+    }
 }
 
 /// Small candidate set: parse every candidate and run the predicate on the real
@@ -424,7 +466,7 @@ fn scan_leaves(
     input: &BorrowedBytes<'_>,
 ) -> Result<Vec<Vec<Match>>, ScanError> {
     let mut leaf_matches: Vec<Vec<Match>> = Vec::with_capacity(plan.leaves.len());
-    for leaf in &plan.leaves {
+    for leaf in plan.leaves.iter() {
         let mut sink: Vec<Match> = Vec::new();
         leaf.engine
             .matches(input, &mut sink)
@@ -610,18 +652,18 @@ impl std::error::Error for ScanError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScanMode, ScanQuery};
+    use super::{PushdownFinish, ScanMode, ScanQuery, choose_finish};
     use crate::JsonPath;
     use serde_json::{Value, json};
 
     /// Scan-path values and DOM-path values for the same query over the same text.
-    /// Forces [`ScanMode::Scan`]: these behavioral tests pin the byte pipeline itself,
+    /// Forces [`ScanMode::AlwaysScan`]: these behavioral tests pin the byte pipeline itself,
     /// and the tiny documents here would otherwise trip the adaptive budget and
     /// silently exercise the DOM path instead.
     fn both(query: &str, text: &str) -> (Vec<Value>, Vec<Value>) {
         let scan = ScanQuery::parse(query)
             .expect("test query must compile")
-            .with_mode(ScanMode::Scan);
+            .with_mode(ScanMode::AlwaysScan);
         let scanned = scan
             .query_values(text)
             .expect("scan evaluation must succeed on valid JSON");
@@ -731,7 +773,7 @@ mod tests {
         let nested = r#"{"x": {"a\"b": 1}, "y": {"a\"b": 2}}"#;
         let mixed = ScanQuery::parse(r#"$.x['a"b']"#)
             .expect("test query must compile")
-            .with_mode(ScanMode::Scan);
+            .with_mode(ScanMode::AlwaysScan);
         assert!(
             mixed.uses_scan(),
             "the plain `$.x` prefix scans; the escaped name is residual"
@@ -758,7 +800,7 @@ mod tests {
 
         let scan_mode = ScanQuery::parse("$.a[*]")
             .expect("`$.a[*]` compiles")
-            .with_mode(ScanMode::Scan);
+            .with_mode(ScanMode::AlwaysScan);
         assert!(scan_mode.uses_scan(), "`$.a[*]` runs in scan mode");
         // The engine's contract on malformed input: undefined results, guaranteed
         // termination, no panic. Either outcome is acceptable; reaching this assert at
@@ -778,7 +820,7 @@ mod tests {
         let text = format!("{}1{}", "[".repeat(300), "]".repeat(300));
         let query = ScanQuery::parse("$[0][0]")
             .expect("`$[0][0]` compiles")
-            .with_mode(ScanMode::Scan);
+            .with_mode(ScanMode::AlwaysScan);
         assert!(query.uses_scan(), "an index-only prefix runs in scan mode");
         assert!(
             query.query_values(&text).is_err(),
@@ -798,11 +840,11 @@ mod tests {
                 .expect("adaptive evaluation must succeed on valid JSON");
             let forced_scan = base
                 .clone()
-                .with_mode(ScanMode::Scan)
+                .with_mode(ScanMode::AlwaysScan)
                 .query_values(text)
                 .expect("forced-scan evaluation must succeed on valid JSON");
             let forced_dom = base
-                .with_mode(ScanMode::Dom)
+                .with_mode(ScanMode::NeverScan)
                 .query_values(text)
                 .expect("forced-DOM evaluation must succeed on valid JSON");
             assert_eq!(
@@ -826,12 +868,12 @@ mod tests {
             "adaptive: `$[*]` is statically non-selective, so it goes DOM"
         );
         assert!(
-            query.clone().with_mode(ScanMode::Scan).uses_scan(),
-            "forcing ScanMode::Scan overrides the static routing"
+            query.clone().with_mode(ScanMode::AlwaysScan).uses_scan(),
+            "forcing ScanMode::AlwaysScan overrides the static routing"
         );
         assert!(
-            !query.clone().with_mode(ScanMode::Dom).uses_scan(),
-            "ScanMode::Dom never scans"
+            !query.clone().with_mode(ScanMode::NeverScan).uses_scan(),
+            "ScanMode::NeverScan never scans"
         );
         assert_eq!(
             query
@@ -890,6 +932,26 @@ mod tests {
     }
 
     #[test]
+    fn pushdown_finish_boundary_follows_the_cost_ratio() {
+        assert!(
+            matches!(choose_finish(1, 32, 1), PushdownFinish::ParseCandidates),
+            "candidate bytes at exactly input×leaves/ratio parse directly"
+        );
+        assert!(
+            matches!(choose_finish(2, 32, 1), PushdownFinish::LeafScans),
+            "candidate bytes past the boundary take the leaf scans"
+        );
+        assert!(
+            matches!(choose_finish(2, 32, 2), PushdownFinish::ParseCandidates),
+            "each additional leaf raises the cost of the leaf-scan finish"
+        );
+        assert!(
+            matches!(choose_finish(0, 0, 0), PushdownFinish::ParseCandidates),
+            "an empty input with no leaves degenerates to the direct parse"
+        );
+    }
+
+    #[test]
     fn pushdown_direct_and_leaf_scan_finishes_agree() {
         // Same query, two documents: in the padded one the candidates are a sliver of
         // the input (the span pass chooses the direct parse — no leaf scans); in the
@@ -917,7 +979,7 @@ mod tests {
         let query = "$.a[?@.x > 5]";
         let pushdown = ScanQuery::parse(query)
             .expect("test query must compile")
-            .with_mode(ScanMode::Scan)
+            .with_mode(ScanMode::AlwaysScan)
             .query_values(text)
             .expect("scan evaluation must succeed");
         assert!(
@@ -972,7 +1034,7 @@ mod tests {
         );
         let expected = adaptive
             .clone()
-            .with_mode(ScanMode::Dom)
+            .with_mode(ScanMode::NeverScan)
             .query_values(text)
             .expect("forced-DOM evaluation must succeed on valid JSON");
         assert_eq!(

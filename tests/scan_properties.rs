@@ -72,7 +72,7 @@ proptest! {
         let want: Vec<Value> = dom_query.query_values(&document).into_iter().cloned().collect();
 
         let compiled = ScanQuery::new(&dom_query);
-        for mode in [ScanMode::Scan, ScanMode::Adaptive, ScanMode::Dom] {
+        for mode in [ScanMode::AlwaysScan, ScanMode::Adaptive, ScanMode::NeverScan] {
             let got = compiled
                 .clone()
                 .with_mode(mode)
