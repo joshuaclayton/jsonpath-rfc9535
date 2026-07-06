@@ -87,11 +87,15 @@ test-no-default: setup-nextest
   cargo nextest run --workspace --no-default-features
   cargo test --doc --no-default-features
 
-# Run the test suite with the `scan` feature on — the hybrid byte-scanning evaluator
+# Run the test suite with the `scan` feature on, in both regex configurations — the
+# scan module has regex-gated behavior (pushdown of match()/search() predicates) that
+# only one build or the other exercises
 [group('test')]
 test-scan: setup-nextest
   cargo nextest run --workspace --features scan
   cargo test --doc --features scan
+  cargo nextest run --workspace --no-default-features --features scan
+  cargo test --doc --no-default-features --features scan
 
 # Verify code formatting
 [group('test')]

@@ -17,4 +17,6 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   byte-scanning the structural prefix (rsonpath) and finishing filters per extracted
   fragment — including filter pushdown, which decides pushable predicates from
   auxiliary scans and parses only passing candidates. `ScanMode` selects between
-  adaptive (default), forced-scan, and forced-DOM strategies. Requires Rust 1.89.
+  adaptive (default), always-scan, and never-scan strategies. Raises the crate's MSRV
+  to Rust 1.89 (`rsonpath-lib` pins it; the bump applies to every build, scan enabled
+  or not).

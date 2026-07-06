@@ -585,8 +585,9 @@ fn filter_query_has_root(query: &crate::compiled::FilterQuery) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Plan, split};
+    use super::{LeafPlan, LexOrderedLeaves, Plan, split};
     use crate::JsonPath;
+    use rsonpath::engine::{Compiler, RsonpathEngine};
 
     /// The split decision for `query`, reduced to what the tests assert on.
     #[derive(Debug, PartialEq, Eq)]
@@ -661,6 +662,11 @@ mod tests {
             kind("$.a[?@.b && @.c.d]"),
             Kind::Pushdown(2, 0),
             "each distinct singular path becomes one leaf scan"
+        );
+        assert_eq!(
+            kind("$.a[?@.b && @.b.c]"),
+            Kind::Pushdown(2, 0),
+            "a leaf path extending another still yields two scans (nested placement)"
         );
         assert_eq!(
             kind("$.a[?@.b < 3 || @.b > 7]"),
@@ -830,6 +836,48 @@ mod tests {
             whole("$.store.book[?@.p[*]]"),
             Some(false),
             "a named prefix is data-dependent, never statically whole-document"
+        );
+    }
+
+    #[test]
+    fn lex_ordered_leaves_restores_prefix_before_extension_order() {
+        // `build_pushdown` happens to pre-sort its paths, so the constructor's own
+        // sort is the only guard against a future construction path that does not —
+        // pin it with deliberately out-of-order input.
+        let engine = |query: &str| {
+            RsonpathEngine::compile_query(
+                &rsonpath_syntax::parse(query).expect("test query must parse"),
+            )
+            .expect("test query must compile")
+        };
+        let path = |names: &[&str]| {
+            names
+                .iter()
+                .map(|&name| name.to_owned())
+                .collect::<Vec<_>>()
+        };
+        let shuffled = vec![
+            LeafPlan {
+                engine: engine("$.x"),
+                path: path(&["b", "c"]),
+            },
+            LeafPlan {
+                engine: engine("$.x"),
+                path: path(&["b"]),
+            },
+            LeafPlan {
+                engine: engine("$.x"),
+                path: path(&["a"]),
+            },
+        ];
+        let ordered: Vec<Vec<String>> = LexOrderedLeaves::sorted(shuffled)
+            .iter()
+            .map(|leaf| leaf.path.clone())
+            .collect();
+        assert_eq!(
+            ordered,
+            [path(&["a"]), path(&["b"]), path(&["b", "c"])],
+            "sorted() puts a path before its extensions regardless of construction order"
         );
     }
 
