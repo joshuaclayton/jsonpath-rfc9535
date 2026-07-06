@@ -142,8 +142,10 @@ implementation details.
   parses only the values that pass. No whole-document DOM is ever built, so cost scales
   with what the query selects rather than document size: 2-25x faster than
   parse-then-query for one-shot text querying on selective queries. Adds the
-  `rsonpath-lib`/`rsonpath-syntax` dependencies and requires Rust 1.89. See the
-  `ScanQuery` docs for modes and caveats.
+  `rsonpath-lib`/`rsonpath-syntax` dependencies and raises the crate-wide MSRV to
+  Rust 1.89 (scan enabled or not). See the `ScanQuery` docs for modes and caveats —
+  in particular, scan-mode results over adversarial input have documented divergences
+  from DOM evaluation and must not feed security decisions.
 
 ## Conformance
 

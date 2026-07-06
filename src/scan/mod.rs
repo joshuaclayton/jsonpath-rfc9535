@@ -159,9 +159,11 @@ impl ScanQuery {
     ///   evaluation.
     /// * **Duplicate member names.** RFC 8259 calls their behavior unpredictable, and
     ///   the pipelines here genuinely differ: DOM evaluation sees `serde_json`'s
-    ///   last-occurrence value, while a pushed-down filter judges the *first*
-    ///   occurrence (the byte engine reports only that one). Documents with duplicated
-    ///   keys get no consistency guarantee in any mode.
+    ///   last-occurrence value, while a pushed-down filter judges the first *or* the
+    ///   last occurrence depending on which finish its cost model picks (the byte
+    ///   engine reports only the first; the direct-parse finish re-parses with
+    ///   `serde_json`). Documents with duplicated keys get no consistency guarantee
+    ///   in any mode.
     /// * **Nesting depth.** Deeply nested documents error rather than evaluate: each
     ///   fragment is parsed with `serde_json` (its recursion limit applies), and the
     ///   engine has a depth cap of its own. DOM mode hits the same `serde_json` limit
@@ -170,6 +172,14 @@ impl ScanQuery {
     ///   are extracted once per nesting level, so total fragment bytes can exceed the
     ///   document size. [`ScanMode::Adaptive`] (the default) detects this mid-scan and
     ///   falls back to a whole-document parse; [`ScanMode::AlwaysScan`] pays the full cost.
+    /// * **Adversarial input.** The divergences above (escaped names, duplicate
+    ///   members, undefined results on malformed text) are all trivially craftable in
+    ///   valid JSON — an attacker can hide a member from scan-mode filters by writing
+    ///   its name with a Unicode escape — and [`ScanMode::AlwaysScan`] additionally
+    ///   drops the adaptive memory bound. Do not gate security decisions (redaction,
+    ///   deny-listing, authorization) on scan-mode results over untrusted text;
+    ///   evaluate with [`ScanMode::NeverScan`], or [`JsonPath`] over parsed input,
+    ///   instead.
     ///
     /// # Errors
     ///
@@ -291,12 +301,18 @@ enum BudgetOutcome {
 /// sits near total coverage anyway.
 fn run_scan_within_budget(plan: &ScanPlan, json_text: &str) -> BudgetOutcome {
     let mut sink = BudgetedSink::new(json_text.len());
-    match plan
+    let outcome = plan
         .engine
-        .matches(&BorrowedBytes::new(json_text.as_bytes()), &mut sink)
-    {
+        .matches(&BorrowedBytes::new(json_text.as_bytes()), &mut sink);
+    if sink.exceeded {
+        // Checked before the engine's own result on purpose: once the sink asked to
+        // abort, the collected matches are truncated and must not be evaluated —
+        // even if the engine somehow finished (or failed differently) after the
+        // abort request.
+        return BudgetOutcome::Exceeded;
+    }
+    match outcome {
         Ok(()) => BudgetOutcome::Done(process_fragments(plan, sink.matches)),
-        Err(_) if sink.exceeded => BudgetOutcome::Exceeded,
         Err(error) => BudgetOutcome::Done(Err(engine_error(error))),
     }
 }
@@ -425,6 +441,13 @@ fn finish_by_parsing_candidates(
 /// entirely — which engine-produced spans never do — yields `None` rather than
 /// panicking.
 fn parse_candidate(bytes: &[u8], span: &MatchSpan) -> Result<Option<Value>, ScanError> {
+    // Only a span's end may legally exceed the input (whitespace padding); a start
+    // outside the input would mean a broken engine invariant — loud in debug, a
+    // silently skipped candidate in release.
+    debug_assert!(
+        span.start_idx() <= bytes.len(),
+        "a candidate span must start inside the input"
+    );
     let end = span.end_idx().min(bytes.len());
     let Some(slice) = bytes.get(span.start_idx()..end) else {
         return Ok(None);
@@ -446,7 +469,17 @@ fn finish_by_leaf_scans(
     let bytes = json_text.as_bytes();
     let mut cursors = vec![0_usize; plan.leaves.len()];
     let mut out = Vec::new();
+    let mut prev_end = 0_usize;
     for span in candidate_spans {
+        // The cursor alignment in `assemble_synthetic` is sound only for disjoint,
+        // document-ordered spans — guaranteed today by the child-only prefix; if an
+        // engine change ever broke that, fail loudly in debug rather than misassign
+        // leaves silently.
+        debug_assert!(
+            span.start_idx() >= prev_end,
+            "candidate spans must be disjoint and in document order"
+        );
+        prev_end = span.end_idx();
         let synthetic = assemble_synthetic(plan, &leaf_matches, &mut cursors, &span)?;
         if !crate::eval::eval_logical(plan.predicate.expr(), &synthetic, &synthetic) {
             continue;
@@ -552,7 +585,8 @@ fn engine_error(error: rsonpath::engine::error::EngineError) -> ScanError {
 
 /// A [`Sink`] that aborts the engine run once cumulative fragment bytes pass `budget`.
 /// The abort travels as an engine error; `exceeded` is the authoritative signal that
-/// the error was this sink's abort rather than a real engine failure.
+/// the budget tripped, and [`run_scan_within_budget`] consults it before the engine's
+/// own result so a truncated match set can never be evaluated.
 struct BudgetedSink {
     matches: Vec<Match>,
     budget: usize,
@@ -652,18 +686,34 @@ impl std::error::Error for ScanError {
 
 #[cfg(test)]
 mod tests {
-    use super::{PushdownFinish, ScanMode, ScanQuery, choose_finish};
+    use super::{
+        BudgetOutcome, Plan, PushdownFinish, ScanError, ScanMode, ScanQuery, choose_finish,
+        run_scan_within_budget,
+    };
     use crate::JsonPath;
     use serde_json::{Value, json};
 
     /// Scan-path values and DOM-path values for the same query over the same text.
     /// Forces [`ScanMode::AlwaysScan`]: these behavioral tests pin the byte pipeline itself,
     /// and the tiny documents here would otherwise trip the adaptive budget and
-    /// silently exercise the DOM path instead.
+    /// silently exercise the DOM path instead. Asserts the byte engine actually runs —
+    /// a splitter regression demoting the shape to DOM would otherwise make the
+    /// comparison trivially true; the deliberate DOM-plan cases use
+    /// [`both_expecting`] with `false`.
     fn both(query: &str, text: &str) -> (Vec<Value>, Vec<Value>) {
+        both_expecting(query, text, true)
+    }
+
+    /// [`both`], with an explicit expectation of whether the query byte-scans.
+    fn both_expecting(query: &str, text: &str, expect_scan: bool) -> (Vec<Value>, Vec<Value>) {
         let scan = ScanQuery::parse(query)
             .expect("test query must compile")
             .with_mode(ScanMode::AlwaysScan);
+        assert_eq!(
+            scan.uses_scan(),
+            expect_scan,
+            "`{query}`: expected uses_scan() == {expect_scan}"
+        );
         let scanned = scan
             .query_values(text)
             .expect("scan evaluation must succeed on valid JSON");
@@ -754,14 +804,14 @@ mod tests {
             !quote.uses_scan(),
             "an escape-requiring name at the root falls back to DOM mode"
         );
-        let (scanned, dom) = both(r#"$['a"b']"#, text);
+        let (scanned, dom) = both_expecting(r#"$['a"b']"#, text, false);
         assert_eq!(
             scanned, dom,
             "a key containing a double quote resolves via DOM"
         );
         assert_eq!(scanned, [json!(1)], "the quoted key selects its value");
 
-        let (scanned, dom) = both(r"$['c\\d']", text);
+        let (scanned, dom) = both_expecting(r"$['c\\d']", text, false);
         assert_eq!(
             scanned, dom,
             "a key containing a backslash resolves via DOM"
@@ -789,26 +839,32 @@ mod tests {
 
     #[test]
     fn malformed_json_errors_in_dom_mode_and_terminates_in_scan_mode() {
-        let malformed = r#"{"a": [1, 2"#;
-
+        // Degenerate shapes: truncated JSON, empty input, whitespace-only, and
+        // BOM-prefixed text. DOM mode must report each as `InvalidJson`; scan mode's
+        // contract is undefined results with guaranteed panic-free termination —
+        // completing the loop IS the property under test.
         let dom_mode = ScanQuery::parse("$").expect("`$` compiles");
         assert!(!dom_mode.uses_scan(), "`$` runs in DOM-fallback mode");
-        assert!(
-            dom_mode.query_values(malformed).is_err(),
-            "DOM mode reports malformed JSON as an error"
-        );
-
         let scan_mode = ScanQuery::parse("$.a[*]")
             .expect("`$.a[*]` compiles")
             .with_mode(ScanMode::AlwaysScan);
         assert!(scan_mode.uses_scan(), "`$.a[*]` runs in scan mode");
-        // The engine's contract on malformed input: undefined results, guaranteed
-        // termination, no panic. Either outcome is acceptable; reaching this assert at
-        // all is the property under test.
-        let outcome = scan_mode.query_values(malformed);
+        for malformed in [r#"{"a": [1, 2"#, "", " ", "\u{feff}{\"a\": [1]}"] {
+            assert!(
+                matches!(
+                    dom_mode.query_values(malformed),
+                    Err(ScanError::InvalidJson { .. })
+                ),
+                "DOM mode reports {malformed:?} as InvalidJson"
+            );
+            drop(scan_mode.query_values(malformed));
+        }
+
+        // Malformed input the byte engine itself detects surfaces as the `Engine`
+        // variant (verified: a lone closing bracket trips its depth tracking).
         assert!(
-            outcome.is_ok() || outcome.is_err(),
-            "scan mode terminates without panicking on malformed input"
+            matches!(scan_mode.query_values("]"), Err(ScanError::Engine { .. })),
+            "engine-detected malformed input maps to ScanError::Engine"
         );
     }
 
@@ -823,8 +879,11 @@ mod tests {
             .with_mode(ScanMode::AlwaysScan);
         assert!(query.uses_scan(), "an index-only prefix runs in scan mode");
         assert!(
-            query.query_values(&text).is_err(),
-            "a document nested beyond the parse limits reports an error"
+            matches!(
+                query.query_values(&text),
+                Err(ScanError::InvalidFragment { .. })
+            ),
+            "the ~298-deep fragment exceeds serde_json's recursion limit (InvalidFragment)"
         );
     }
 
@@ -968,25 +1027,45 @@ mod tests {
     }
 
     #[test]
-    fn pushdown_sees_the_first_duplicate_member_where_dom_sees_the_last() {
+    fn pushdown_duplicate_member_verdict_depends_on_the_finish() {
         // Duplicate member names are "unpredictable behavior" per RFC 8259, and the
-        // two pipelines genuinely diverge (verified against rsonpath 0.10): the byte
-        // engine reports only the FIRST occurrence of a duplicated member, while
-        // serde_json's parsed Value keeps the LAST. This test pins the divergence so
+        // two pushdown finishes genuinely diverge (verified against rsonpath 0.10):
+        // the leaf-scan finish judges the engine's FIRST occurrence, while the
+        // direct-parse finish judges serde's LAST (agreeing with DOM). Which finish
+        // runs depends on candidate bytes vs input size, so both are pinned here so
         // a change in either engine surfaces loudly; the caveat is documented on
         // `query_values`.
-        let text = r#"{"a": [{"x": 1, "x": 9}, {"x": 2}]}"#;
+        let items = r#"[{"x": 1, "x": 9}, {"x": 2}]"#;
         let query = "$.a[?@.x > 5]";
-        let pushdown = ScanQuery::parse(query)
+
+        // Bare document: candidates span most of the input, so the leaf-scan finish
+        // runs and judges the first occurrence (1 > 5 is false).
+        let bare = format!(r#"{{"a": {items}}}"#);
+        let scanned = ScanQuery::parse(query)
             .expect("test query must compile")
             .with_mode(ScanMode::AlwaysScan)
-            .query_values(text)
+            .query_values(&bare)
             .expect("scan evaluation must succeed");
         assert!(
-            pushdown.is_empty(),
-            "pushdown judges the first occurrence (1 > 5 is false)"
+            scanned.is_empty(),
+            "the leaf-scan finish judges the first duplicate (1 > 5 is false)"
         );
-        let document: Value = serde_json::from_str(text).expect("test document must parse");
+
+        // Padded document: candidates are a sliver of the input, so the direct-parse
+        // finish runs, judges the real fragment (serde last-wins), and agrees with DOM.
+        let padded = format!(r#"{{"pad": "{}", "a": {items}}}"#, "y".repeat(4096));
+        let scanned = ScanQuery::parse(query)
+            .expect("test query must compile")
+            .with_mode(ScanMode::AlwaysScan)
+            .query_values(&padded)
+            .expect("scan evaluation must succeed");
+        assert_eq!(
+            scanned,
+            [json!({"x": 9})],
+            "the direct-parse finish judges serde's last-wins value, agreeing with DOM"
+        );
+
+        let document: Value = serde_json::from_str(&bare).expect("test document must parse");
         let dom: Vec<Value> = JsonPath::parse(query)
             .expect("test query must compile")
             .query_values(&document)
@@ -1017,6 +1096,68 @@ mod tests {
             "search() over an extracted string leaf agrees"
         );
         assert_eq!(scanned.len(), 2, "both Rust titles match");
+    }
+
+    #[test]
+    fn adaptive_budget_trips_only_on_overlapping_fragments() {
+        // Directly observes the budget decision (`Exceeded` vs `Done`) — the
+        // end-to-end fallback test below cannot: its results are identical whether
+        // or not the budget actually tripped.
+        let query = ScanQuery::parse("$..a").expect("test query must compile");
+        assert!(
+            matches!(query.plan, Plan::Scan(_)),
+            "`$..a` splits to a plain fragment-scan plan"
+        );
+        let Plan::Scan(plan) = &query.plan else {
+            return;
+        };
+        let overlapping =
+            r#"{"a": {"pad": "xxxxxxxxxxxxxxxx", "a": {"pad": "yyyyyyyyyyyyyyyy", "b": 1}}}"#;
+        assert!(
+            matches!(
+                run_scan_within_budget(plan, overlapping),
+                BudgetOutcome::Exceeded
+            ),
+            "self-nested `a` fragments overlap: cumulative bytes exceed the input and trip the budget"
+        );
+        let flat = r#"{"x": {"a": {"b": 1}}, "y": {"a": {"c": 2}}}"#;
+        assert!(
+            matches!(
+                run_scan_within_budget(plan, flat),
+                BudgetOutcome::Done(Ok(_))
+            ),
+            "disjoint fragments sum to at most the input length and never trip the budget"
+        );
+    }
+
+    #[test]
+    fn pushdown_with_nested_leaf_paths_matches_dom() {
+        // One leaf path extends another (`b` and `b.c`): the exact shape
+        // `LexOrderedLeaves` protects — the parent's extracted object must be placed
+        // in the synthetic fragment before the deeper leaf is nested inside it.
+        let text = r#"{"a": [
+            {"k": "both", "b": {"c": 1}},
+            {"k": "scalar-parent", "b": 2},
+            {"k": "missing-parent"},
+            {"k": "deep", "b": {"c": 9}}
+        ]}"#;
+        for query in [
+            "$.a[?@.b && @.b.c]",
+            "$.a[?@.b.c > 1]",
+            "$.a[?@.b && !@.b.c].k",
+        ] {
+            let scan = ScanQuery::parse(query).expect("test query must compile");
+            assert!(scan.uses_scan(), "`{query}` must push down");
+            let (scanned, dom) = both(query, text);
+            assert_eq!(
+                scanned, dom,
+                "`{query}`: nested-leaf pushdown agrees with DOM"
+            );
+            assert!(
+                !scanned.is_empty(),
+                "`{query}` selects something (non-vacuous test)"
+            );
+        }
     }
 
     #[test]
