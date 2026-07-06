@@ -26,11 +26,11 @@
 //! never see `$`-rooted sub-queries; [`split`](split::split) rejects those at
 //! construction.
 
+mod rsonpath_boundary;
 mod split;
 
 use crate::{Error, JsonPath};
 use core::str::FromStr;
-use rsonpath::engine::Engine as _;
 use rsonpath::input::BorrowedBytes;
 use rsonpath::result::{Match, MatchSpan, Sink};
 use serde_json::Value;
@@ -108,17 +108,19 @@ impl ScanQuery {
     /// Splitting never fails: a query the byte engine cannot express simply runs in
     /// DOM-fallback mode.
     pub fn parse(query: &str) -> Result<Self, Error> {
-        Ok(Self::new(&JsonPath::parse(query)?))
+        Ok(Self::new(JsonPath::parse(query)?))
     }
 
     /// Builds a scan plan from an already-compiled query. Infallible: worst case the
     /// plan is a transparent DOM fallback. Runs in [`ScanMode::Adaptive`]; see
-    /// [`with_mode`](Self::with_mode).
+    /// [`with_mode`](Self::with_mode). Takes the path by value — it becomes the plan's
+    /// DOM-fallback query; callers keeping their own copy can clone at the call site.
     #[must_use]
-    pub fn new(path: &JsonPath) -> Self {
+    pub fn new(path: JsonPath) -> Self {
+        let plan = split::split(path.compiled());
         Self {
-            fallback: path.clone(),
-            plan: split::split(path.compiled()),
+            fallback: path,
+            plan,
             mode: ScanMode::default(),
         }
     }
@@ -143,10 +145,15 @@ impl ScanQuery {
     /// # Caveats
     ///
     /// * **Malformed input.** In scan mode the byte engine's results over invalid JSON
-    ///   are *undefined* — evaluation is guaranteed to terminate without panicking, but
-    ///   may return `Ok` with meaningless values rather than an error. DOM-fallback
-    ///   mode always reports invalid JSON as [`ScanError::InvalidJson`]. Validate
-    ///   untrusted input separately if you rely on rejection.
+    ///   are *undefined* — evaluation terminates without panicking, but may return
+    ///   `Ok` with meaningless values rather than an error. The engine has been
+    ///   observed to panic internally on malformed input (an upstream rsonpath bug,
+    ///   found by this crate's fuzz harness); those panics are caught at the engine
+    ///   boundary and surfaced as [`ScanError::Engine`] — under `panic = "abort"`
+    ///   they abort the process instead, and the global panic hook may still log a
+    ///   message. DOM-fallback mode always reports invalid JSON as
+    ///   [`ScanError::InvalidJson`]. Validate untrusted input separately if you rely
+    ///   on rejection.
     /// * **Ordering.** Results are in document order; this can differ from
     ///   [`JsonPath::query_values`] only where RFC 9535 leaves ordering unspecified
     ///   (descendant segments, object member order).
@@ -271,9 +278,11 @@ impl FromStr for ScanQuery {
 /// fragment, then run the per-fragment residual.
 fn run_scan(plan: &ScanPlan, json_text: &str) -> Result<Vec<Value>, ScanError> {
     let mut matches: Vec<Match> = Vec::new();
-    plan.engine
-        .matches(&BorrowedBytes::new(json_text.as_bytes()), &mut matches)
-        .map_err(engine_error)?;
+    rsonpath_boundary::collect_matches(
+        &plan.engine,
+        &BorrowedBytes::new(json_text.as_bytes()),
+        &mut matches,
+    )?;
     process_fragments(plan, matches)
 }
 
@@ -300,10 +309,12 @@ enum BudgetOutcome {
 /// fragments and re-parses from scratch), while the break-even against a DOM parse
 /// sits near total coverage anyway.
 fn run_scan_within_budget(plan: &ScanPlan, json_text: &str) -> BudgetOutcome {
-    let mut sink = BudgetedSink::new(json_text.len());
-    let outcome = plan
-        .engine
-        .matches(&BorrowedBytes::new(json_text.as_bytes()), &mut sink);
+    let mut sink = BudgetedSink::overlap_tripwire(json_text.len());
+    let outcome = rsonpath_boundary::collect_matches(
+        &plan.engine,
+        &BorrowedBytes::new(json_text.as_bytes()),
+        &mut sink,
+    );
     if sink.exceeded {
         // Checked before the engine's own result on purpose: once the sink asked to
         // abort, the collected matches are truncated and must not be evaluated —
@@ -313,7 +324,7 @@ fn run_scan_within_budget(plan: &ScanPlan, json_text: &str) -> BudgetOutcome {
     }
     match outcome {
         Ok(()) => BudgetOutcome::Done(process_fragments(plan, sink.matches)),
-        Err(error) => BudgetOutcome::Done(Err(engine_error(error))),
+        Err(error) => BudgetOutcome::Done(Err(error)),
     }
 }
 
@@ -371,11 +382,14 @@ fn emit_through_residual(residual: &RootFreeSegments, fragment: Value, out: &mut
 fn run_pushdown(plan: &PushdownPlan, json_text: &str) -> Result<Vec<Value>, ScanError> {
     let input = BorrowedBytes::new(json_text.as_bytes());
     let mut candidate_spans: Vec<MatchSpan> = Vec::new();
-    plan.candidates
-        .approximate_spans(&input, &mut candidate_spans)
-        .map_err(engine_error)?;
+    rsonpath_boundary::collect_approximate_spans(&plan.candidates, &input, &mut candidate_spans)?;
 
-    let candidate_bytes: usize = candidate_spans.iter().map(MatchSpan::len).sum();
+    // Saturating on purpose: provably non-overflowing only via the span-disjointness
+    // invariant, and the cost model should stay total even if that ever broke.
+    let candidate_bytes = candidate_spans
+        .iter()
+        .map(MatchSpan::len)
+        .fold(0_usize, usize::saturating_add);
     match choose_finish(candidate_bytes, json_text.len(), plan.leaves.len()) {
         PushdownFinish::ParseCandidates => {
             finish_by_parsing_candidates(plan, json_text, &candidate_spans)
@@ -441,13 +455,10 @@ fn finish_by_parsing_candidates(
 /// entirely — which engine-produced spans never do — yields `None` rather than
 /// panicking.
 fn parse_candidate(bytes: &[u8], span: &MatchSpan) -> Result<Option<Value>, ScanError> {
-    // Only a span's end may legally exceed the input (whitespace padding); a start
-    // outside the input would mean a broken engine invariant — loud in debug, a
-    // silently skipped candidate in release.
-    debug_assert!(
-        span.start_idx() <= bytes.len(),
-        "a candidate span must start inside the input"
-    );
+    // Only a span's end may legally exceed the input (whitespace padding). A start
+    // outside the input cannot happen on valid JSON, but malformed input makes the
+    // engine's spans undefined — `bytes.get` below turns that into a skipped
+    // candidate rather than a panic.
     let end = span.end_idx().min(bytes.len());
     let Some(slice) = bytes.get(span.start_idx()..end) else {
         return Ok(None);
@@ -472,13 +483,15 @@ fn finish_by_leaf_scans(
     let mut prev_end = 0_usize;
     for span in candidate_spans {
         // The cursor alignment in `assemble_synthetic` is sound only for disjoint,
-        // document-ordered spans — guaranteed today by the child-only prefix; if an
-        // engine change ever broke that, fail loudly in debug rather than misassign
-        // leaves silently.
-        debug_assert!(
-            span.start_idx() >= prev_end,
-            "candidate spans must be disjoint and in document order"
-        );
+        // document-ordered spans. On valid JSON the child-only prefix guarantees
+        // that; on malformed input the engine's spans are undefined and can overlap
+        // or regress (found by the differential fuzzer), and the monotone cursors
+        // cannot rewind — skip such spans instead. Results on malformed input are
+        // documented as undefined, and an engine regression on *valid* JSON would
+        // surface as a scan/DOM divergence in the differential harnesses.
+        if span.start_idx() < prev_end {
+            continue;
+        }
         prev_end = span.end_idx();
         let synthetic = assemble_synthetic(plan, &leaf_matches, &mut cursors, &span)?;
         if !crate::eval::eval_logical(plan.predicate.expr(), &synthetic, &synthetic) {
@@ -501,9 +514,7 @@ fn scan_leaves(
     let mut leaf_matches: Vec<Vec<Match>> = Vec::with_capacity(plan.leaves.len());
     for leaf in plan.leaves.iter() {
         let mut sink: Vec<Match> = Vec::new();
-        leaf.engine
-            .matches(input, &mut sink)
-            .map_err(engine_error)?;
+        rsonpath_boundary::collect_matches(&leaf.engine, input, &mut sink)?;
         leaf_matches.push(sink);
     }
     Ok(leaf_matches)
@@ -556,31 +567,29 @@ fn assemble_synthetic(
 /// Places a leaf value at its member-name path in the synthetic fragment, creating
 /// intermediate objects as needed. Leaves arrive in the plan's lexicographic path
 /// order — a path before any extension of itself — so an overlapping deeper leaf
-/// lands inside its parent's already-inserted object; a non-object intermediate
-/// cannot occur (the deeper leaf could not have byte-matched through a scalar) and is
-/// left untouched if it somehow does.
+/// lands inside its parent's already-inserted object. A non-object intermediate
+/// cannot occur for documents without duplicated member names (a deeper leaf cannot
+/// byte-match through a scalar); with duplicates it can — the parent leaf may hold a
+/// scalar first occurrence while the deeper leaf matched through a later duplicate —
+/// and the deeper leaf is dropped, inside the documented no-consistency zone for
+/// duplicated keys. A loop rather than recursion on purpose: path length is
+/// query-controlled, and iteration keeps hostile queries from turning placement into
+/// deep recursion.
 fn insert_leaf(target: &mut serde_json::Map<String, Value>, path: &[String], value: Value) {
-    let Some((first, rest)) = path.split_first() else {
+    let Some((leaf_name, parents)) = path.split_last() else {
         return;
     };
-    if rest.is_empty() {
-        target.insert(first.clone(), value);
-        return;
+    let mut current = target;
+    for name in parents {
+        let entry = current
+            .entry(name.clone())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let Value::Object(inner) = entry else {
+            return;
+        };
+        current = inner;
     }
-    let entry = target
-        .entry(first.clone())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    if let Value::Object(inner) = entry {
-        insert_leaf(inner, rest, value);
-    }
-}
-
-/// Wraps an engine failure as [`ScanError::Engine`], boxed so the typed source
-/// survives without naming the engine's error type in this crate's public API.
-fn engine_error(error: rsonpath::engine::error::EngineError) -> ScanError {
-    ScanError::Engine {
-        source: Box::new(error),
-    }
+    current.insert(leaf_name.clone(), value);
 }
 
 /// A [`Sink`] that aborts the engine run once cumulative fragment bytes pass `budget`.
@@ -595,10 +604,14 @@ struct BudgetedSink {
 }
 
 impl BudgetedSink {
-    const fn new(budget: usize) -> Self {
+    /// A sink whose budget is the input's own length. Only overlapping (self-nested)
+    /// matches can accumulate more fragment bytes than the document holds, so this
+    /// trips precisely on the overlap pathology and never on a flat document, whose
+    /// disjoint fragments sum to at most the input length.
+    const fn overlap_tripwire(input_len: usize) -> Self {
         Self {
             matches: Vec::new(),
-            budget,
+            budget: input_len,
             spent: 0,
             exceeded: false,
         }
@@ -609,7 +622,9 @@ impl Sink<Match> for BudgetedSink {
     type Error = BudgetExceeded;
 
     fn add_match(&mut self, data: Match) -> Result<(), BudgetExceeded> {
-        self.spent += data.bytes().len();
+        // Saturating: overflow would need ~2^64 cumulative bytes, but a wrapped
+        // counter would disable the budget on exactly the inputs it exists for.
+        self.spent = self.spent.saturating_add(data.bytes().len());
         if self.spent > self.budget {
             self.exceeded = true;
             return Err(BudgetExceeded);
@@ -988,6 +1003,59 @@ mod tests {
                 "`{query}` selects something (non-vacuous test)"
             );
         }
+    }
+
+    #[test]
+    fn engine_panic_on_malformed_input_is_absorbed() {
+        // Found by the differential fuzzer, then minimized: rsonpath 0.10 panics
+        // internally on this input (a slice-index panic in its match-writing path).
+        // The boundary must absorb the panic into `ScanError::Engine` so the
+        // documented no-panic contract holds. Bytes kept verbatim — the shape that
+        // trips the engine is not otherwise reproducible.
+        const REPRO: &[u8] = &[
+            123, 91, 34, 97, 34, 52, 91, 50, 52, 52, 50, 58, 7, 91, 97, 13, 93, 61, 58, 9, 58, 61,
+            13, 26, 9, 11, 123, 91, 10, 10, 61, 58, 9, 58, 61, 9, 58, 61, 13, 10, 61, 9, 58, 61,
+            13, 93, 61, 58, 9, 13, 74, 93, 61, 58, 9, 61, 13, 13, 13, 58, 74, 93, 61, 58, 9, 58,
+            13, 13,
+        ];
+        let text = core::str::from_utf8(REPRO).expect("repro bytes are ASCII");
+        for query in ["$.a.b", "$..a", "$.a[*].b", "$[?@.x]", "$.a[?@.n > 3]"] {
+            let compiled = ScanQuery::parse(query).expect("test query must compile");
+            for mode in [
+                ScanMode::AlwaysScan,
+                ScanMode::Adaptive,
+                ScanMode::NeverScan,
+            ] {
+                drop(compiled.clone().with_mode(mode).query_values(text));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_input_with_disordered_spans_terminates() {
+        // Found by the differential fuzzer (`just fuzz`): on this malformed input
+        // the engine emits overlapping/out-of-order candidate spans, which the
+        // pushdown finishes must skip — never panic over.
+        for query in ["$[?@.x]", "$.a[?@.n > 3]", "$.a[?@.b && @.b.k]"] {
+            let compiled = ScanQuery::parse(query).expect("test query must compile");
+            for mode in [
+                ScanMode::AlwaysScan,
+                ScanMode::Adaptive,
+                ScanMode::NeverScan,
+            ] {
+                drop(compiled.clone().with_mode(mode).query_values("[S[}}"));
+            }
+        }
+    }
+
+    #[test]
+    fn from_str_delegates_to_parse() {
+        let query: ScanQuery = "$.a.b".parse().expect("`$.a.b` compiles via FromStr");
+        assert!(query.uses_scan(), "the parsed query plans a byte scan");
+        assert!(
+            "$[".parse::<ScanQuery>().is_err(),
+            "FromStr rejects invalid queries exactly like parse()"
+        );
     }
 
     #[test]

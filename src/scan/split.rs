@@ -408,8 +408,12 @@ fn is_bare_wildcard(segment: &Segment) -> bool {
 }
 
 /// Whether `segment` can live in the byte-scanned prefix: a single verbatim-safe name,
-/// wildcard, or non-negative index selector. Slices are excluded by policy (they stay
-/// in the residual), negative indexes because the engine cannot count from the end.
+/// wildcard, or non-negative index selector. Slices are excluded by policy: the engine
+/// compiles only forward, from-start forms (from-end bounds and backward steps are
+/// `UnsupportedFeatureError`s), so admitting slices would make eligibility depend on
+/// each slice's internals — keeping them all in the residual keeps the rule
+/// shape-independent. Negative indexes are excluded because the engine cannot count
+/// from the end.
 fn prefix_eligible(segment: &Segment) -> bool {
     let (Segment::Child(selectors) | Segment::Descendant(selectors)) = segment;
     let [selector] = selectors.as_slice() else {

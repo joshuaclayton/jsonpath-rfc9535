@@ -8,8 +8,9 @@ keywords = ["jsonpath", "rfc9535", "json", "query", "nom"]
 categories = ["parser-implementations", "data-structures"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-# Benchmarks and their fixtures are dev-only; keep them out of the published .crate.
-exclude = ["/benches"]
+# Benchmarks, their fixtures, and the fuzz harness are dev-only; keep them out of the
+# published .crate.
+exclude = ["/benches", "/fuzz"]
 
 [dependencies]
 nom = "^8"

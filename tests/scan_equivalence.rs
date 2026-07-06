@@ -25,7 +25,7 @@
 
 mod common;
 
-use common::multiset;
+use common::{has_descendant_segment, multiset};
 use jsonpath_rfc9535::{JsonPath, ScanMode, ScanQuery};
 use serde::Deserialize;
 use serde_json::Value;
@@ -134,7 +134,7 @@ fn run_case(case: &Case) -> Result<bool, String> {
         let matched = got == want
             // Document order may legally differ from DOM visit order only under
             // descendant segments; everywhere else an order difference is a real bug.
-            || (case.selector.contains("..") && multiset(&got) == multiset(&want));
+            || (has_descendant_segment(&case.selector) && multiset(&got) == multiset(&want));
         if !matched {
             return Err(format!(
                 "{mode}/DOM mismatch: {mode} selected {} nodes, DOM {}",

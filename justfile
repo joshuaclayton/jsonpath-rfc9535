@@ -124,6 +124,14 @@ test-lint-scan:
 coverage: setup
   cargo llvm-cov nextest --workspace --tests --html --open --ignore-filename-regex test_support
 
+# Differential-fuzz the scan pipelines against DOM evaluation (on demand; not part of
+# `just ci`). Requires nightly + cargo-fuzz; runs until interrupted unless bounded,
+# e.g. `just fuzz -- -max_total_time=300`.
+[group('test')]
+fuzz *ARGS: setup-nightly
+  cargo install cargo-fuzz --locked
+  cargo +nightly fuzz run scan_differential {{ARGS}}
+
 # Run doc tests
 [group('test')]
 test-doc:
