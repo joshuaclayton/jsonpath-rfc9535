@@ -74,7 +74,7 @@ pub struct PushdownPlan {
     /// Spans only — candidate bytes are never copied unless the candidate passes.
     pub candidates: RsonpathEngine,
     /// One auxiliary engine per distinct singular path the predicate references.
-    pub leaves: Vec<LeafPlan>,
+    pub leaves: LexOrderedLeaves,
     /// The filter, evaluated per candidate against the synthetic fragment.
     pub predicate: RootFreePredicate,
     /// Segments evaluated over each passing candidate (candidate = start = root).
@@ -88,10 +88,35 @@ pub struct LeafPlan {
     /// Engine for the leaf's values across all candidates, in document order.
     pub engine: RsonpathEngine,
     /// The member-name steps, used to place extracted values in the synthetic
-    /// fragment. The plan's leaves are in lexicographic path order, which puts a path
-    /// before any extension of itself — the placement order `insert_leaf` relies on
-    /// to nest deeper leaves inside their parents' already-placed objects.
+    /// fragment (see [`LexOrderedLeaves`] for the ordering `insert_leaf` relies on).
     pub path: Vec<String>,
+}
+
+/// A pushdown plan's leaf scans, held in lexicographic path order — a path before any
+/// extension of itself. That is the placement order `insert_leaf` relies on to nest
+/// deeper leaves inside their parents' already-placed objects; a reordering (say, by
+/// selectivity) would silently drop nested leaves from synthetic fragments.
+/// [`sorted`](Self::sorted) is the only constructor.
+#[derive(Debug, Clone)]
+pub struct LexOrderedLeaves(Vec<LeafPlan>);
+
+impl LexOrderedLeaves {
+    /// Wraps `leaves`, restoring the lexicographic path order if construction
+    /// disturbed it.
+    fn sorted(mut leaves: Vec<LeafPlan>) -> Self {
+        leaves.sort_by(|a, b| a.path.cmp(&b.path));
+        Self(leaves)
+    }
+
+    /// The number of leaf scans the plan runs.
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The leaves, in their guaranteed order.
+    pub fn iter(&self) -> std::slice::Iter<'_, LeafPlan> {
+        self.0.iter()
+    }
 }
 
 /// A filter expression verified at construction to reference no `$`-rooted sub-query,
@@ -189,16 +214,21 @@ pub fn split(query: &Query) -> Plan {
         // with extra steps. (An empty prefix *with* a predicate stays: `$[?P]` → `$[*]` + P.)
         return Plan::Dom;
     }
-    // Exactly two rendered-prefix shapes select ~the whole document no matter what the
-    // document contains: `$[?P]…` renders to `$[*]` (fragments = every child of the
-    // root), and a lone bare wildcard step (`$[*]` / `$..*`) does the same or worse.
-    // Deeper wildcards (`$.a[*]`) are data-dependent and stay unmarked.
-    let whole_document = if predicate.is_some() {
+    let whole_document = statically_covers_whole_document(prefix, predicate.is_some());
+    build_scan(prefix, predicate, residual, whole_document)
+}
+
+/// Whether the rendered prefix selects essentially the whole document *for any
+/// document*. Exactly two shapes do: a predicate cut with an empty prefix (`$[?P]…`
+/// renders to `$[*]` — fragments are every child of the root), and a lone bare
+/// wildcard step (`$[*]` / `$..*`), which does the same or worse. Deeper wildcards
+/// (`$.a[*]`) are data-dependent and stay unmarked.
+fn statically_covers_whole_document(prefix: &[Segment], has_predicate: bool) -> bool {
+    if has_predicate {
         prefix.is_empty()
     } else {
         matches!(prefix, [segment] if is_bare_wildcard(segment))
-    };
-    build_scan(prefix, predicate, residual, whole_document)
+    }
 }
 
 /// The filter a cut segment contributes as a per-fragment predicate: present exactly
@@ -279,7 +309,7 @@ fn build_pushdown(
         .collect::<Option<Vec<_>>>()?;
     Some(PushdownPlan {
         candidates,
-        leaves,
+        leaves: LexOrderedLeaves::sorted(leaves),
         predicate: predicate.clone(),
         residual: residual.clone(),
     })

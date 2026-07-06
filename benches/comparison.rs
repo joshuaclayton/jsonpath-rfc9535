@@ -345,7 +345,7 @@ fn bench_extract(c: &mut Criterion) {
             // heuristic buys or costs on each case.
             let hybrid = ScanQuery::parse(case.rfc)
                 .ok()
-                .map(|adaptive| (adaptive.clone(), adaptive.with_mode(ScanMode::Scan)));
+                .map(|adaptive| (adaptive.clone(), adaptive.with_mode(ScanMode::AlwaysScan)));
             if let Some((adaptive, forced)) = &hybrid {
                 assert!(
                     forced.uses_scan(),
