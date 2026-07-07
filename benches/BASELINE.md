@@ -271,3 +271,88 @@ Reading the table:
 Remaining known losses: none in `extract/`. The pathological shapes (self-nested
 documents under descendant prefixes, duplicate member names) degrade or diverge as
 documented on `ScanQuery::query_values`.
+
+## Update 2026-07-07 — small-object linear-scan member lookups; serde_json_path rows
+
+### The bench build measures the `preserve_order` backend
+
+Sample-profiling `query/wildcard/25k` showed **~58% of self time in SipHash**
+(`BuildHasher::hash_one`): the `jsonpath_lib` dev-dependency enables
+`serde_json/preserve_order`, so every bench and test in this repo builds `serde_json`
+with the IndexMap backend, where each `Map::get`/`get_key_value` hashes the name.
+Every number in this file was collected on that backend. Feature unification applies
+to all engines in the comparison bench equally, so *cross-engine ratios* are fair —
+but users of jsonpath-rfc9535 without `preserve_order` get the BTreeMap backend, which
+this repo's harnesses never measured until now (see the out-of-tree check below).
+
+### Linear scan for small objects (`get_member`)
+
+A query re-looks-up the *same literal name* once per node visited, so the lookup is
+the hot instruction stream of every name-bearing shape. `eval.rs` now scans objects of
+≤ 16 members linearly (a handful of short-key memcmps — cheaper than one SipHash or a
+BTree node walk on either backend); larger objects keep the map's own lookup. Applied
+at every name site: `apply_name`, `descend_name`, both singular fast paths, and filter
+sub-queries.
+
+A/B vs a same-session baseline, `query/*/25k` (preserve_order build, quiet machine):
+
+| query @25k | before | after | change |
+|---|---|---|---|
+| child | 33.5 ns | 20.2 ns | **−40%** |
+| wildcard | 461 µs | 205 µs | **−56%** |
+| descendant | 2.17 ms | 1.77 ms | **−21%** |
+| filter_comparison | 921 µs | 701 µs | **−23%** |
+| filter_exists | 482 µs | 332 µs | **−33%** |
+| filter_string_eq | 948 µs | 482 µs | **−49%** |
+| filter_function | 1.98 ms | 1.12 ms | **−43%** |
+| filter_search | 1.38 ms | 1.11 ms | **−16%** |
+| filter_match | 2.26 ms | 1.88 ms | **−17%** |
+| filter_regex_dynamic | 51.5 ms | 44.6 ms | **−13%** |
+| descendant_wildcard | 2.12 ms | 2.03 ms | −4% (no name lookups in `$..*`) |
+
+The full-suite run vs the committed `main` baseline confirms the effect at every
+document size (child −40% flat across small→100k; wildcard −50…−58%; paths API too:
+`micro/path_overhead/wildcard/paths` −24%, `micro/singular/depth4` −39%).
+
+Measurement notes, so future A/Bs don't chase ghosts: (1) `parse/*` moved ±10% in
+these runs — the parser never executes `get_member`; ns-scale parse benches shift
+with binary layout whenever `eval.rs` changes size. (2) The 50k rows have a
+demonstrated ±30% run-to-run drift band on this machine (same code, same baseline,
+20 minutes apart: `filter_comparison/50k` "+32%"), so they cannot resolve effects
+of the size measured here; neighbouring sizes (25k, 100k) reproduce the improvement.
+(3) A background video call (krisp/zoom) inflated one measurement leg by up to +85%
+— check `ps`/load before trusting a surprising number.
+
+**Default (BTreeMap) backend**: an out-of-tree harness (path-dep on this crate only,
+so `preserve_order` stays off) shows the change is neutral-to-positive there as well
+(descendant −8%, filter_comparison −16%, filter_exists −20%, nested_wildcard −18%,
+child/wildcard within noise). CTS 703/703 and the full feature-matrix test suite pass.
+
+### serde_json_path and jsonpath-rust added to the `eval/` comparison
+
+Competitive context (crates.io, 2026-07-07): `jsonpath-rust` is by far the
+most-downloaded JSONPath crate (76.4M all-time, 12.7M last-90d, +20% half-over-half,
+69 dependents, maintained); `serde_json_path` is far smaller (1.7M all-time,
+569k/90d, 52 dependents, last release 2025-02) but the fastest-growing (+49%
+half-over-half) and carries the strict-RFC-compliance reputation; `jsonpath_lib` is
+unmaintained since 2021 and declining (−10% half-over-half) but remains the
+historical DOM speed baseline. Both RFC crates now run in `eval/` compile-once rows
+(`jsonpath-rust` via `parse_json_path` + `js_path_process`) alongside `e2e/`.
+
+Standing vs `serde_json_path` at 25k eval-only after this change (same run, quiet
+machine): child **20.9 ns vs 200 ns** (9.6×), author_wildcard **208 µs vs 1.38 ms**
+(6.6×), descendant_price **1.96 ms vs 4.76 ms** (2.4×), nested_wildcard **1.66 ms vs
+6.17 ms** (3.7×), filter_cheap **729 µs vs 876 µs** (1.2×), filter_selective **115 ns
+vs 326 ns** (2.8×), filter_search **2.11 ms vs 212 ms** (100×; serde_json_path
+recompiles the regex per element). jsonpath_lib is behind on every case as well
+(author_wildcard 2.6×, filter_cheap 2.5×, child 10.7×).
+
+Standing vs `jsonpath-rust` (compile-once via `parse_json_path` + `js_path_process`)
+at 25k: child **20.9 ns vs 322 ns** (15×), author_wildcard **208 µs vs 5.21 ms**
+(25×), descendant_price **1.96 ms vs 49.6 ms** (25×), nested_wildcard **1.66 ms vs
+14.5 ms** (8.7×), filter_cheap **729 µs vs 3.83 ms** (5.3×), filter_selective
+**115 ns vs 668 ns** (5.8×), filter_search **2.11 ms vs 48.3 ms** (23×). Note its
+`js_path_process` builds a path per selected node, so these rows carry path overhead
+our `query_values` row does not — but `micro/path_overhead` puts our paths API at
+2–3× the values API on these shapes, which still leaves every row several times
+ahead of jsonpath-rust.

@@ -1,10 +1,13 @@
 //! Cross-library performance comparison (feature `compare`).
 //!
-//! Runs jsonpath-rfc9535 against three other engines on **equivalent queries**:
-//! `jsonpath_lib` (Goessner dialect — fast, the DOM baseline we want to match or beat),
-//! `jsonpath-rust` (also RFC 9535, DOM-based), and `rsonpath` (RFC 9535, but a
-//! fundamentally different *raw-bytes + SIMD* engine — see the `scan/` note below). Run
-//! with:
+//! Runs jsonpath-rfc9535 against four other engines on **equivalent queries**:
+//! `jsonpath-rust` (RFC 9535; by far the most-downloaded JSONPath crate — ~12.7M
+//! downloads in the 90 days to 2026-07, growing), `serde_json_path` (RFC 9535; much
+//! smaller at ~570k/90d but the fastest-growing, with a strict-compliance reputation),
+//! `jsonpath_lib` (Goessner dialect; unmaintained since 2021 and declining, but
+//! historically the fast DOM baseline this project set out to match), and `rsonpath`
+//! (RFC 9535, but a fundamentally different *raw-bytes + SIMD* engine — see the
+//! `scan/` note below). Run with:
 //!
 //! ```text
 //! cargo bench --features compare --bench comparison
@@ -148,6 +151,10 @@ fn count_jsonpath_rust(document: &Value, rfc: &str) -> usize {
     document.query(rfc).map_or(0, |nodes| nodes.len())
 }
 
+fn count_serde_json_path(document: &Value, rfc: &str) -> usize {
+    serde_json_path::JsonPath::parse(rfc).map_or(0, |path| path.query(document).len())
+}
+
 fn rsonpath_engine(query: &str) -> Option<RsonpathEngine> {
     let parsed = rsonpath_syntax::parse(query).ok()?;
     RsonpathEngine::compile_query(&parsed).ok()
@@ -179,6 +186,12 @@ fn assert_equivalent(size: &str, document: &Value, case: &Case) {
     assert_eq!(
         jp, jr,
         "jsonpath-rfc9535 vs jsonpath-rust disagree on `{}` over {size}: {jp} vs {jr} nodes",
+        case.label
+    );
+    let sjp = count_serde_json_path(document, case.rfc);
+    assert_eq!(
+        jp, sjp,
+        "jsonpath-rfc9535 vs serde_json_path disagree on `{}` over {size}: {jp} vs {sjp} nodes",
         case.label
     );
     if let Some(goessner) = case.goessner {
@@ -225,6 +238,21 @@ fn bench_eval(c: &mut Criterion) {
                     b.iter(|| compiled.select(black_box(&document)));
                 });
             }
+            if let Ok(path) = serde_json_path::JsonPath::parse(case.rfc) {
+                group.bench_function("serde_json_path", |b| {
+                    b.iter(|| path.query(black_box(&document)).all());
+                });
+            }
+            if let Ok(query) = jsonpath_rust::parser::parse_json_path(case.rfc) {
+                group.bench_function("jsonpath-rust", |b| {
+                    b.iter(|| {
+                        jsonpath_rust::query::js_path_process(
+                            black_box(&query),
+                            black_box(&document),
+                        )
+                    });
+                });
+            }
             group.finish();
         }
     }
@@ -247,6 +275,12 @@ fn bench_end_to_end(c: &mut Criterion) {
             }
             group.bench_function("jsonpath-rust", |b| {
                 b.iter(|| document.query(black_box(case.rfc)));
+            });
+            group.bench_function("serde_json_path", |b| {
+                b.iter(|| {
+                    serde_json_path::JsonPath::parse(black_box(case.rfc))
+                        .map(|path| path.query(black_box(&document)).all())
+                });
             });
             group.finish();
         }
