@@ -77,9 +77,9 @@ compare = ["regex", "scan"]
 criterion = "0.8.2"
 jsonpath-rust = "1.0.4"
 jsonpath_lib = "0.3.0"
-serde_json_path = "0.7.2"
 proptest = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json_path = "0.7.2"
 
 [[bin]]
 name = "jp"
