@@ -347,6 +347,34 @@ vs 326 ns** (2.8×), filter_search **2.11 ms vs 212 ms** (100×; serde_json_path
 recompiles the regex per element). jsonpath_lib is behind on every case as well
 (author_wildcard 2.6×, filter_cheap 2.5×, child 10.7×).
 
+### Segment fusion (tried, rejected)
+
+A depth-first rewrite of `walk` — each selected node threaded immediately through the
+remaining segments, no per-segment frontier vector — was implemented behind a generic
+emitter (final segment = direct push, identical to the status quo; earlier segments =
+recurse). Stash-flip A/B on a quiet machine (load < 1.5, both legs): **wildcard
+values +26% (25k) / +45% (10k micro)**, filter_function +8.6%; single-segment shapes
+neutral; no reproducible paths-mode win. Cause: after the linear-scan lookup landed,
+a values-mode frontier entry is one 8-byte sequential write (`(NoPath, &Value)` — the
+ZST vanishes), while the fused continuation pays a `walk_from` call + segment match +
+selector-slice loop **per node** (~5–10 ns) on every high-fanout expansion. Rejected;
+the frontier walk stays.
+
+### Frontier batching (tried, rejected)
+
+The follow-up hypothesis — make the frontier cheaper still via bulk insertion and
+buffer reuse — also failed its A/B (quiet machine, vs the same clean baseline).
+Replacing `apply_wildcard`'s reserve+push loop with a `TrustedLen` `Vec::extend`
+cost **+43.7% on wildcard/25k** (+36% at 10k micro; `$..*` values +16%): the
+hand-written loop was already compiling to better code than the iterator-adapter
+chain, and per-call `extend` setup is pure overhead on the fixture's many 0–3
+element arrays. Double-buffering `walk`'s frontier (two ping-ponged buffers instead
+of one `with_capacity` per segment) bisected to a further +1…+9%. Both reverted.
+Conclusion: after the linear-scan lookup, the segment-at-a-time frontier walk with
+reserve+push sinks is a measured local optimum — remaining eval headroom is in
+*what runs per node* (filter machinery, regex dispatch), not in how selected nodes
+are buffered.
+
 Standing vs `jsonpath-rust` (compile-once via `parse_json_path` + `js_path_process`)
 at 25k: child **20.9 ns vs 322 ns** (15×), author_wildcard **208 µs vs 5.21 ms**
 (25×), descendant_price **1.96 ms vs 49.6 ms** (25×), nested_wildcard **1.66 ms vs
