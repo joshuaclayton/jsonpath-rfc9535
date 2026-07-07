@@ -129,7 +129,7 @@ fn eval_singular_located<'a>(
             ast::SingularSegment::Name(name) => {
                 // Borrow the document's own key for the path (it equals `name`), so the
                 // path step costs no string allocation.
-                let (key, member) = value.as_object()?.get_key_value(name)?;
+                let (key, member) = get_member(value.as_object()?, name)?;
                 value = member;
                 path = path.child_name(key);
             }
@@ -206,7 +206,7 @@ fn descend_name<'a, P: Position<'a>>(
 ) {
     match value {
         Value::Object(members) => {
-            if let Some((key, member)) = members.get_key_value(name) {
+            if let Some((key, member)) = get_member(members, name) {
                 out.push((path.descend_name(key), member));
             }
             // Only descend into members that can actually contain a deeper match — a
@@ -234,6 +234,27 @@ fn descend_name<'a, P: Position<'a>>(
 #[inline]
 const fn is_container(value: &Value) -> bool {
     matches!(value, Value::Object(_) | Value::Array(_))
+}
+
+/// Objects at or below this size are searched by scanning entries instead of by
+/// `Map::get_key_value`. With `serde_json`'s `preserve_order` backend (`IndexMap`) a
+/// map lookup hashes (`SipHash`) the name on every call — the single hottest cost in
+/// wildcard and descendant traversal, since a query re-looks-up the same literal name
+/// per node. A linear scan of a few short keys is cheaper than one hash on either
+/// backend; large objects still take the map's own sublinear lookup.
+const LINEAR_SCAN_MAX: usize = 16;
+
+/// Looks up member `name`, scanning small objects linearly (see [`LINEAR_SCAN_MAX`]).
+#[inline]
+fn get_member<'a>(
+    members: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> Option<(&'a String, &'a Value)> {
+    if members.len() <= LINEAR_SCAN_MAX {
+        members.iter().find(|&(key, _)| key == name)
+    } else {
+        members.get_key_value(name)
+    }
 }
 
 /// Applies `selectors` to `value` and every descendant in pre-order (a node before its
@@ -294,7 +315,7 @@ fn apply_name<'a, P: Position<'a>>(
 ) {
     if let Some((key, member)) = value
         .as_object()
-        .and_then(|members| members.get_key_value(name))
+        .and_then(|members| get_member(members, name))
     {
         out.push((path.descend_name(key), member));
     }
@@ -499,7 +520,7 @@ fn eval_singular<'a>(
     };
     for segment in &query.segments {
         value = match segment {
-            ast::SingularSegment::Name(name) => value.as_object()?.get(name)?,
+            ast::SingularSegment::Name(name) => get_member(value.as_object()?, name)?.1,
             ast::SingularSegment::Index(index) => index_into(value, index.get())?,
         };
     }
