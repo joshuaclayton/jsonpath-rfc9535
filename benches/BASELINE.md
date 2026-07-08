@@ -443,6 +443,24 @@ measure `--features rayon` (the configuration of record); the cross-library
 `compare` bench deliberately stays serial so engine-vs-engine ratios remain
 single-core apples-to-apples, with this section carrying the parallel story.
 
+### Bench-profile LTO (tried, rejected) and the suite trim
+
+`[profile.bench] lto = "thin", codegen-units = 1` was A/B'd on a 6-row subset with a
+dead-function perturbation probe on each side: **no jitter damping** (mean |swing|
+1.9% without vs 2.5% with — and the probe itself barely moved anything, so the
+historical ±7–16% swings require real-code-sized inlining changes or machine state,
+not mere binary perturbation), **hot query rows +4…+12% slower** (global inlining
+fights the hand-placed `#[inline]` structure), parse rows −23% (real, but parse is
+nobody's bottleneck), and builds 1 s → 19 s. Rejected.
+
+The suite itself was trimmed the same day to what the optimisation sessions actually
+consulted: `queries` runs small/25k/100k (10k/50k dropped — 50k sits on a cache
+cliff with a ±30% noise floor; regenerate via `generate.py` for occasional
+staircase sweeps), `micro/` moved to the 25k fixture, and the comparison bench keeps
+`eval/` (25k/100k) and `extract/` (1k/25k/100k) while dropping `e2e/` (arithmetic:
+parse + eval) and the count-only `scan/` group (superseded by `extract/`). A full
+`bench-save-baseline` drops from ~2 h to ~40 min with no loss of decision power.
+
 ### Frontier batching (tried, rejected)
 
 The follow-up hypothesis — make the frontier cheaper still via bulk insertion and

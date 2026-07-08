@@ -52,10 +52,11 @@ fn bookstore() -> Value {
 /// Fixture sizes loaded from `benches/data/` at runtime (generate with
 /// `benches/data/generate.py`); any missing size is skipped.
 const FIXTURES: &[(&str, &str)] = &[
-    ("1k", "bookstore-1k.json"),
-    ("10k", "bookstore-10k.json"),
+    // Two generated scale points beside the inline `small` document: the 25k
+    // iteration workhorse and the 100k at-scale story. The intermediate sizes bought
+    // no decisions (50k sits on a cache cliff with a ±30% noise floor); regenerate
+    // them via `generate.py 10k 50k` for an occasional full staircase sweep.
     ("25k", "bookstore-25k.json"),
-    ("50k", "bookstore-50k.json"),
     ("100k", "bookstore-100k.json"),
 ];
 
@@ -153,11 +154,12 @@ fn bench_query(c: &mut Criterion) {
 /// * `micro/path_overhead/*` runs the same query over the 10k document twice — once via
 ///   [`JsonPath::query_values`] (no paths) and once via [`JsonPath::query`] (which builds
 ///   a `NormalizedPath` per selected node). The delta is exactly the path-construction
-///   cost — the per-node `Rc` allocation that the path-free value path avoids.
+///   cost — the per-node `Rc` allocation that the path-free value path avoids. Runs
+///   over the 25k fixture.
 /// * `micro/singular/*` exercises the singular fast path (pure name/index chains, which
 ///   skip the worklist entirely) at increasing depth.
 fn bench_micro(c: &mut Criterion) {
-    let Some(document) = load("bookstore-10k.json") else {
+    let Some(document) = load("bookstore-25k.json") else {
         return;
     };
 
