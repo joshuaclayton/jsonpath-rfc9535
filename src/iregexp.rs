@@ -11,6 +11,42 @@
 //! [RFC 9485]: https://www.rfc-editor.org/rfc/rfc9485
 //! [RFC 9485 §5.4]: https://www.rfc-editor.org/rfc/rfc9485#section-5.4
 
+/// Whether `pattern` is free of every I-Regexp metacharacter, so matching it reduces
+/// to plain string comparison: `match()` is equality, `search()` is substring
+/// containment — no regex engine involved.
+///
+/// The excluded set is exactly the complement of RFC 9485's `NormalChar` rule
+/// (`( ) * + . ? [ \ ] { | }`), plus `^` and `$`: the ABNF admits those two as
+/// ordinary characters, but the jsonpath-compliance-test-suite pins them to their
+/// PCRE *anchor* semantics ("explicit caret"/"explicit dollar" cases), which is what
+/// the regex-backed path implements — so a pattern containing them must keep taking
+/// that path. A byte scan is exact here: every metacharacter is ASCII, and no UTF-8
+/// continuation byte overlaps the ASCII range.
+///
+/// A consequence of matching the `NormalChar` complement: every plain pattern is
+/// also a *valid* I-Regexp, so the "invalid pattern yields false" rule (RFC 9535
+/// §2.4.6) can never apply to one.
+pub fn is_plain(pattern: &str) -> bool {
+    !pattern.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'(' | b')'
+                | b'*'
+                | b'+'
+                | b'.'
+                | b'?'
+                | b'['
+                | b'\\'
+                | b']'
+                | b'{'
+                | b'|'
+                | b'}'
+                | b'^'
+                | b'$'
+        )
+    })
+}
+
 /// Translates `pattern` from I-Regexp to a `regex` pattern and compiles it, anchoring
 /// for a full match when `anchored` is true. Returns `None` if the pattern is not a
 /// valid regular expression (so the caller yields `LogicalFalse`, per RFC 9535 §2.4.6).
@@ -59,7 +95,24 @@ fn translate(pattern: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::build;
+    use super::{build, is_plain};
+
+    #[test]
+    fn plain_patterns_have_no_metacharacters() {
+        assert!(is_plain("Number 1"), "letters, digits, space");
+        assert!(is_plain(""), "empty pattern is plain");
+        assert!(is_plain("a-b,c/d"), "NormalChar punctuation is plain");
+        assert!(is_plain("naïve café ✓"), "non-ASCII is plain");
+        for pattern in [
+            "a.c", "a*", "a+", "a?", "[jk]", "a]b", "(x)", "x)", "a{2}", "b}", "a|b", r"a\.b",
+            "^ab", "bc$",
+        ] {
+            assert!(
+                !is_plain(pattern),
+                "{pattern:?} contains a metacharacter (or CTS-pinned anchor)"
+            );
+        }
+    }
 
     #[test]
     fn match_is_anchored_and_dot_excludes_newline() {

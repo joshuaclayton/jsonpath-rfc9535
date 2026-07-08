@@ -623,18 +623,47 @@ fn regex_test(
         return false;
     };
     match pattern {
+        // A metacharacter-free `match()` pattern is string equality — no engine.
+        crate::compiled::Pattern::Plain(plain) => plain_match(text, plain, anchored),
+        // A metacharacter-free `search()` pattern is a SIMD substring search whose
+        // tables were built once at compile time.
+        crate::compiled::Pattern::Substring(finder) => finder.find(text.as_bytes()).is_some(),
         // The literal pattern was compiled once at `JsonPath::parse` time (with the
         // right anchoring); evaluation only matches.
         crate::compiled::Pattern::Literal(regex) => {
             regex.as_ref().is_some_and(|regex| regex.is_match(text))
         }
-        // A document-derived pattern must be compiled now.
+        // A document-derived pattern must be handled now: string-compare when the
+        // computed value is metacharacter-free (unlike the literal case, this pays for
+        // `search()` too — the alternative here is a full regex *compile* per call,
+        // which dwarfs a scalar substring scan), else compile per call.
         crate::compiled::Pattern::Dynamic(arg) => {
             let pattern_value = eval_value_arg(arg, current, root);
-            comparand_str(&pattern_value)
-                .and_then(|expression| crate::iregexp::build(expression, anchored))
-                .is_some_and(|regex| regex.is_match(text))
+            comparand_str(&pattern_value).is_some_and(|expression| {
+                if crate::iregexp::is_plain(expression) {
+                    plain_match(text, expression, anchored)
+                } else {
+                    crate::iregexp::build(expression, anchored)
+                        .is_some_and(|regex| regex.is_match(text))
+                }
+            })
         }
+    }
+}
+
+/// Matches a metacharacter-free pattern: `match()` (anchored) is string equality,
+/// `search()` is substring containment. Exactly the I-Regexp semantics of a pattern
+/// with no metacharacters, without the regex engine. The one-shot `memmem::find` is
+/// the unprepared form of the [`Pattern::Substring`](crate::compiled::Pattern)
+/// searcher, for dynamic patterns known only at evaluation time; byte-level search
+/// is exact for UTF-8 (a valid needle can never match starting inside a multi-byte
+/// character).
+#[cfg(feature = "regex")]
+fn plain_match(text: &str, pattern: &str, anchored: bool) -> bool {
+    if anchored {
+        text == pattern
+    } else {
+        memchr::memmem::find(text.as_bytes(), pattern.as_bytes()).is_some()
     }
 }
 
