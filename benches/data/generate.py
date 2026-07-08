@@ -18,9 +18,10 @@ from pathlib import Path
 
 CATEGORIES = ["reference", "fiction", "biography", "technical", "poetry"]
 SIZES = {"1k": 1_000, "10k": 10_000, "25k": 25_000, "50k": 50_000, "100k": 100_000}
-# Written by default; the larger 50k/100k (~10/21 MB) are opt-in to keep routine
-# `just bench` light: `python3 benches/data/generate.py 50k 100k`.
-DEFAULT_SIZES = ["1k", "10k", "25k"]
+# Written by default: 1k (small-doc rows), 25k (the iteration workhorse), 100k (the
+# at-scale story). 10k/50k are opt-in for occasional full-staircase sweeps — 50k in
+# particular sits on this machine's cache cliff and cannot resolve small effects.
+DEFAULT_SIZES = ["1k", "25k", "100k"]
 
 
 def book(rng: random.Random, index: int) -> dict:
