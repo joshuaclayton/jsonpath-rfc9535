@@ -59,6 +59,16 @@ pub enum LogicalExpr {
     And(Box<Self>, Box<Self>),
     Not(Box<Self>),
     Comparison(Comparison),
+    /// The dominant filter shape — a singular query compared against a literal
+    /// (`?@.price < 10`, `?@.category == 'fiction'`) — split out at lowering time so
+    /// evaluation is one lookup plus an in-place compare, with no per-element operand
+    /// wrappers. The query is always on the left; a `literal op query` source is
+    /// stored with the operator mirrored (see [`flip`]).
+    SingularLiteral {
+        query: ast::SingularQuery,
+        op: ast::ComparisonOp,
+        literal: Box<Value>,
+    },
     /// A bare query used as an existence test.
     Existence(ExistenceTest),
     /// A `LogicalType` function used as a test (`match`/`search`). Only `match`/`search`
@@ -259,9 +269,7 @@ fn lower_logical(expr: ast::LogicalExpr) -> Result<LogicalExpr, Error> {
             Box::new(lower_logical(*right)?),
         )),
         ast::LogicalExpr::Not(inner) => Ok(LogicalExpr::Not(Box::new(lower_logical(*inner)?))),
-        ast::LogicalExpr::Comparison(comparison) => {
-            Ok(LogicalExpr::Comparison(lower_comparison(comparison)?))
-        }
+        ast::LogicalExpr::Comparison(comparison) => lower_comparison_expr(comparison),
         ast::LogicalExpr::Existence(query) => {
             // A singular sub-query selects ≤1 node, so existence is an allocation-free
             // presence check; only a genuinely multi-node query needs the worklist walk.
@@ -319,12 +327,39 @@ fn compile_literal(value: &Value, anchored: bool) -> Option<regex::Regex> {
     }
 }
 
-fn lower_comparison(comparison: ast::Comparison) -> Result<Comparison, Error> {
-    Ok(Comparison {
-        left: lower_comparable(comparison.left)?,
-        op: comparison.op,
-        right: lower_comparable(comparison.right)?,
+/// Lowers a comparison, splitting the singular-query-vs-literal shape into
+/// [`LogicalExpr::SingularLiteral`]; every other operand pairing stays a general
+/// [`Comparison`].
+fn lower_comparison_expr(comparison: ast::Comparison) -> Result<LogicalExpr, Error> {
+    let left = lower_comparable(comparison.left)?;
+    let op = comparison.op;
+    let right = lower_comparable(comparison.right)?;
+    Ok(match (left, right) {
+        (Comparable::Singular(query), Comparable::Literal(literal)) => {
+            LogicalExpr::SingularLiteral { query, op, literal }
+        }
+        (Comparable::Literal(literal), Comparable::Singular(query)) => {
+            LogicalExpr::SingularLiteral {
+                query,
+                op: flip(op),
+                literal,
+            }
+        }
+        (left, right) => LogicalExpr::Comparison(Comparison { left, op, right }),
     })
+}
+
+/// Mirrors a comparison operator so `literal op query` can be stored as
+/// `query flip(op) literal`: equality operators are symmetric, orderings reverse.
+const fn flip(op: ast::ComparisonOp) -> ast::ComparisonOp {
+    match op {
+        ast::ComparisonOp::Eq => ast::ComparisonOp::Eq,
+        ast::ComparisonOp::Ne => ast::ComparisonOp::Ne,
+        ast::ComparisonOp::Lt => ast::ComparisonOp::Gt,
+        ast::ComparisonOp::Le => ast::ComparisonOp::Ge,
+        ast::ComparisonOp::Gt => ast::ComparisonOp::Lt,
+        ast::ComparisonOp::Ge => ast::ComparisonOp::Le,
+    }
 }
 
 fn lower_comparable(comparable: ast::Comparable) -> Result<Comparable, Error> {
