@@ -135,6 +135,11 @@ implementation details.
   extensions, backed by an I-Regexp engine. With the feature disabled the crate builds
   without the [`regex`](https://docs.rs/regex) dependency, and a query that uses those
   functions is rejected by `JsonPath::parse`.
+- **`rayon`** *(off by default)* — parallelises `query_values` over large documents
+  (arrays or frontiers of thousands of elements) on the
+  [rayon](https://docs.rs/rayon) global thread pool: 4–9× wall-clock on 100k-element
+  documents, at correspondingly higher CPU use. Results keep exact document order;
+  small documents and the paths API (`query`) always evaluate serially.
 - **`scan`** *(experimental, off by default)* — provides `ScanQuery`: evaluation over
   **raw JSON text** that byte-scans the query's structural prefix (via
   [rsonpath](https://docs.rs/rsonpath-lib)) and evaluates filters per extracted

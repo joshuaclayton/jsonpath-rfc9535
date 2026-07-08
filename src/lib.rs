@@ -91,6 +91,13 @@
 //!   extracted fragment, never building a whole-document DOM. See the type's docs for
 //!   semantics and caveats.
 //!
+//! * **`rayon`** *(off by default)* — parallelises [`JsonPath::query_values`] over
+//!   large documents (arrays or frontiers of thousands of elements) on the
+//!   [rayon](https://docs.rs/rayon) global thread pool: 4–9× wall-clock on
+//!   100k-element documents, at correspondingly higher CPU use. Results keep exact
+//!   document order. Small documents and [`JsonPath::query`] (the paths API) always
+//!   evaluate serially.
+//!
 //! # Conformance
 //!
 //! Correctness is pinned to the official [JSONPath Compliance Test Suite][cts]: every

@@ -63,7 +63,7 @@ bench-fixtures:
 # Run the criterion benchmarks (`-- --baseline main` to compare a baseline, `-- parse/child` to filter)
 [group('bench')]
 bench *ARGS: bench-fixtures
-  CRITERION_HOME={{ CRITERION_HOME }} cargo bench --bench queries {{ ARGS }}
+  CRITERION_HOME={{ CRITERION_HOME }} cargo bench --features rayon --bench queries {{ ARGS }}
 
 # Cross-library comparison (jsonpath-rfc9535 vs jsonpath_lib / jsonpath-rust). Same `-- <args>` form.
 [group('bench')]
@@ -73,13 +73,21 @@ bench-compare *ARGS: bench-fixtures
 # Save the current numbers as the `main` baseline for future comparisons.
 [group('bench')]
 bench-save-baseline: bench-fixtures
-  CRITERION_HOME={{ CRITERION_HOME }} cargo bench --bench queries -- --save-baseline main
+  CRITERION_HOME={{ CRITERION_HOME }} cargo bench --features rayon --bench queries -- --save-baseline main
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --features compare --bench comparison -- --save-baseline main
 
 # Run the test suite
 [group('test')]
 test: setup-nextest release
   cargo nextest run --workspace
+
+# Run the test suite with parallel evaluation on — the CTS harness cross-checks
+# query_values (parallel) against query (serial) on every case, so this pins
+# parallel result order
+[group('test')]
+test-rayon: setup-nextest
+  cargo nextest run --workspace --features rayon
+  cargo test --doc --features rayon
 
 # Run the test suite with the `regex` feature off — verifies match()/search() are rejected
 [group('test')]
@@ -111,6 +119,11 @@ test-lint:
 [group('test')]
 test-lint-no-default:
   cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+
+# Clippy with parallel evaluation on
+[group('test')]
+test-lint-rayon:
+  cargo clippy --workspace --all-targets --features rayon -- -D warnings
 
 # Clippy with the scan feature on, in both regex configurations (the scan module has
 # regex-gated match arms that only one build or the other compiles)
@@ -164,7 +177,7 @@ test-audit: setup-audit
 
 # Run every check CI runs; if this passes, it's ready to merge (coverage is separate: `just coverage`)
 [group('test')]
-ci: test-audit test-fmt test-lint test-lint-no-default test-lint-scan test test-no-default test-scan test-doc test-doc-links test-doc-cfg test-toml
+ci: test-audit test-fmt test-lint test-lint-no-default test-lint-rayon test-lint-scan test test-no-default test-rayon test-scan test-doc test-doc-links test-doc-cfg test-toml
 
 # Dry-run `cargo publish` to catch packaging problems before a real release
 [group('cargo')]
