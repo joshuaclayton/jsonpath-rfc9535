@@ -364,7 +364,7 @@ fn function_paths(function: &Function, paths: &mut Vec<Vec<String>>) -> bool {
 #[cfg(feature = "regex")]
 fn pattern_paths(pattern: &Pattern, paths: &mut Vec<Vec<String>>) -> bool {
     match pattern {
-        Pattern::Literal(_) => true,
+        Pattern::Plain(_) | Pattern::Substring(_) | Pattern::Literal(_) => true,
         Pattern::Dynamic(arg) => value_arg_paths(arg, paths),
     }
 }
@@ -566,7 +566,7 @@ fn function_has_root(function: &Function) -> bool {
 fn pattern_has_root(pattern: &Pattern) -> bool {
     match pattern {
         // A literal pattern is a pre-compiled regex; there is no query inside.
-        Pattern::Literal(_) => false,
+        Pattern::Plain(_) | Pattern::Substring(_) | Pattern::Literal(_) => false,
         Pattern::Dynamic(arg) => value_arg_has_root(arg),
     }
 }

@@ -103,9 +103,17 @@ const QUERIES: &[(&str, &str)] = &[
         "filter_match",
         r#"$.store.book[?match(@.title, "Book Number [0-9]+")]"#,
     ),
+    // Anchored pattern with no metacharacters — takes the plain string-equality fast
+    // path (no regex engine); `filter_match` above keeps the compiled-regex path
+    // covered.
+    (
+        "filter_match_plain",
+        "$.store.book[?match(@.category, 'fiction')]",
+    ),
     // Regex whose pattern is computed from the document (`@.category`), so it cannot be
-    // pre-compiled and must be built per evaluation. Guards that the dynamic-pattern
-    // fallback keeps working and does not regress.
+    // pre-compiled. The computed values here are metacharacter-free, so this row
+    // exercises the dynamic path's per-call plain shortcut; a metacharacter-bearing
+    // computed pattern would still compile per evaluation.
     (
         "filter_regex_dynamic",
         "$.store.book[?search(@.title, @.category)]",

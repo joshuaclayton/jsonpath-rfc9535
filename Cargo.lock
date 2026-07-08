@@ -409,6 +409,7 @@ dependencies = [
  "criterion",
  "jsonpath-rust",
  "jsonpath_lib",
+ "memchr",
  "nom 8.0.0",
  "proptest",
  "regex",

@@ -376,6 +376,44 @@ A/B vs the clean post-lookup baseline @25k (quiet machine): **filter_string_eq
 not the wrappers); control rows within the ±7% layout-jitter band. Numeric-literal pre-decoding (skip the `as_i64/as_f64` chains
 per element) is the remaining known headroom on this shape.
 
+### Plain patterns: equality for `match()`, per-call shortcut for dynamic — and a
+### falsified assumption about `str::contains`
+
+A pattern containing no I-Regexp metacharacter (`( ) * + . ? [ \ ] { | }` — plus
+`^`/`$`, which the CTS pins to their PCRE anchor semantics) has no regex behaviour:
+`match()` on it is string equality, `search()` is substring containment; such a
+pattern is also always a *valid* I-Regexp (the excluded set is exactly the complement
+of RFC 9485's `NormalChar`), so the invalid-pattern-yields-false rule can't apply.
+`iregexp::is_plain` detects this with one ASCII byte-scan.
+
+Where it pays (A/B vs the fresh `main` baseline @25k):
+
+* **`match()` with a plain literal → `Pattern::Plain`, evaluated as `==`**: the new
+  `filter_match_plain` row (`?match(@.category, 'fiction')`) runs at **~500 µs vs
+  ~2 ms** for the equivalent compiled-regex evaluation (~4×). Nothing beats a length
+  check and a memcmp.
+* **Dynamic patterns get the same check per call, for both anchorings**:
+  `filter_regex_dynamic` (`?search(@.title, @.category)` — computed patterns that
+  happen to be metacharacter-free) collapsed **−96%** (44.5 ms → 1.67 ms): the
+  alternative there is a full regex *compile* per element, and the per-call
+  containment check is a one-shot `memmem::find` (SIMD; −36% vs the `str::contains`
+  first cut).
+* **`search()` with a plain literal → `Pattern::Substring`**, a
+  `memchr::memmem::Finder` built once at compile time. Two A/B lessons landed here:
+  `str::contains` was *not* an acceptable shortcut (+117% — std's scalar two-way
+  search loses badly to SIMD `memmem`), and the finder itself is **neutral (−2%)**
+  versus the compiled regex, because the regex crate's literal strategy is already a
+  nearly-direct `memmem` call. Kept for the smaller machinery on the path (no regex
+  `Pool`/lazy-DFA involvement) at zero cost. `filter_match`'s real regex keeps that
+  path covered as the control row. `memchr` was already a transitive dependency of
+  `regex`; declaring it adds no crates.
+
+Measurement note: during verification the machine went through a ~45-minute episode
+where regex-DFA-heavy rows (only) ran up to 2× slower system-wide — reproduced on
+stash-flipped, baseline-identical source, cold-start, quiet load, no thermal flag,
+normal profile shape, then decayed on its own. If regex rows ever read +40…+110%
+against every code state at once, wait it out before believing anything.
+
 ### Frontier batching (tried, rejected)
 
 The follow-up hypothesis — make the frontier cheaper still via bulk insertion and

@@ -29,6 +29,52 @@ mod with_regex {
     }
 
     #[test]
+    fn plain_pattern_match_is_exact_equality() {
+        // A metacharacter-free pattern takes the plain string-comparison fast path;
+        // match() must behave as full-string equality, not substring.
+        let document = json!(["fiction", "nonfiction", "fict"]);
+        let nodes = JsonPath::parse(r#"$[?match(@, "fiction")]"#)
+            .expect("a valid query")
+            .query_values(&document);
+        assert_eq!(
+            nodes,
+            [&json!("fiction")],
+            "a plain match() pattern selects only the exactly-equal string"
+        );
+    }
+
+    #[test]
+    fn plain_pattern_search_is_containment() {
+        let document = json!(["nonfiction", "drama", ""]);
+        let nodes = JsonPath::parse(r#"$[?search(@, "fiction")]"#)
+            .expect("a valid query")
+            .query_values(&document);
+        assert_eq!(
+            nodes,
+            [&json!("nonfiction")],
+            "a plain search() pattern selects strings containing it"
+        );
+    }
+
+    #[test]
+    fn dynamic_plain_pattern_agrees_with_static_semantics() {
+        // A document-derived pattern whose computed value is metacharacter-free takes
+        // the same plain comparison per call.
+        let document = json!({
+            "needle": "world",
+            "values": ["hello world", "worl", "WORLD"]
+        });
+        let nodes = JsonPath::parse("$.values[?search(@, $.needle)]")
+            .expect("a valid query")
+            .query_values(&document);
+        assert_eq!(
+            nodes,
+            [&json!("hello world")],
+            "a dynamic plain pattern is substring containment, case-sensitive"
+        );
+    }
+
+    #[test]
     fn search_finds_a_substring() {
         let document = json!(["hello world", "goodbye"]);
         let nodes = JsonPath::parse(r#"$[?search(@, "world")]"#)

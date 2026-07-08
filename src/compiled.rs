@@ -143,10 +143,23 @@ pub enum Function {
 #[cfg(feature = "regex")]
 #[derive(Debug, Clone)]
 pub enum Pattern {
+    /// A literal `match()` pattern free of I-Regexp metacharacters (see
+    /// [`iregexp::is_plain`](crate::iregexp::is_plain)): anchored matching of such a
+    /// pattern is string *equality* — no engine involved. A plain pattern is always a
+    /// valid I-Regexp, so the invalid-pattern-yields-false rule cannot apply.
+    Plain(Box<str>),
+    /// A literal `search()` pattern free of I-Regexp metacharacters: substring
+    /// containment via a [`memchr::memmem::Finder`] built once here at compile time —
+    /// the same SIMD searcher the regex crate uses for literal patterns, minus the
+    /// meta-engine's per-call dispatch. Boxed: the finder embeds its precomputed
+    /// tables, which would otherwise dominate every enum in the IR (the same
+    /// `large_enum_variant` pressure that boxes literal `Value`s).
+    Substring(Box<memchr::memmem::Finder<'static>>),
     /// A literal pattern, pre-compiled. `None` if it is not a valid I-Regexp, in which
     /// case the function always yields false (RFC 9535 §2.4.6).
     Literal(Option<regex::Regex>),
-    /// A pattern whose value is computed at evaluation time; compiled per call.
+    /// A pattern whose value is computed at evaluation time; compiled per call (or
+    /// string-compared directly when the computed value is itself plain).
     Dynamic(ValueArg),
 }
 
@@ -157,11 +170,13 @@ pub enum Pattern {
 impl PartialEq for Pattern {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Plain(left), Self::Plain(right)) => left == right,
+            (Self::Substring(left), Self::Substring(right)) => left.needle() == right.needle(),
             (Self::Literal(left), Self::Literal(right)) => {
                 left.as_ref().map(regex::Regex::as_str) == right.as_ref().map(regex::Regex::as_str)
             }
             (Self::Dynamic(left), Self::Dynamic(right)) => left == right,
-            (Self::Literal(_), Self::Dynamic(_)) | (Self::Dynamic(_), Self::Literal(_)) => false,
+            (Self::Plain(_) | Self::Substring(_) | Self::Literal(_) | Self::Dynamic(_), _) => false,
         }
     }
 }
@@ -304,13 +319,35 @@ fn literal_to_value(literal: &ast::Literal) -> Value {
     }
 }
 
-/// Lowers a `match`/`search` pattern argument: a literal string is translated and
-/// compiled once (with `anchored` controlling full-match vs substring); anything else
-/// becomes a [`Pattern::Dynamic`] compiled per evaluation.
+/// Lowers a `match`/`search` pattern argument. A metacharacter-free literal string
+/// skips the regex engine entirely: `match()` becomes a [`Pattern::Plain`] equality
+/// check, `search()` a [`Pattern::Substring`] SIMD searcher built once here. Any
+/// other literal is translated and compiled once (with `anchored` controlling
+/// full-match vs substring); anything else becomes a [`Pattern::Dynamic`] handled
+/// per evaluation.
+///
+/// `str::contains` is *not* an acceptable stand-in for the substring case: its scalar
+/// two-way search lost +117% to the regex engine's internal `memmem` on
+/// `filter_search` — the winning move is the same SIMD searcher without the regex
+/// meta-engine around it, not less machinery at any cost.
 #[cfg(feature = "regex")]
 fn lower_pattern(arg: ast::FunctionArg, anchored: bool) -> Result<Pattern, Error> {
     match value_arg(arg)? {
-        ValueArg::Literal(value) => Ok(Pattern::Literal(compile_literal(value.as_ref(), anchored))),
+        ValueArg::Literal(value) => Ok(match value.as_ref() {
+            Value::String(pattern) if crate::iregexp::is_plain(pattern) => {
+                if anchored {
+                    Pattern::Plain(pattern.as_str().into())
+                } else {
+                    Pattern::Substring(Box::new(memchr::memmem::Finder::new(pattern).into_owned()))
+                }
+            }
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Array(_)
+            | Value::Object(_) => Pattern::Literal(compile_literal(value.as_ref(), anchored)),
+        }),
         dynamic @ (ValueArg::Singular(_) | ValueArg::Function(_)) => Ok(Pattern::Dynamic(dynamic)),
     }
 }
