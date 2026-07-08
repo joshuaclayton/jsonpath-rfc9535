@@ -471,6 +471,12 @@ pub fn eval_logical<'a>(expr: &LogicalExpr, current: &'a Value, root: &'a Value)
         }
         LogicalExpr::Not(inner) => !eval_logical(inner, current, root),
         LogicalExpr::Comparison(comparison) => eval_comparison(comparison, current, root),
+        // An absent node is "Nothing": it equals nothing and orders against nothing,
+        // so only `!=` holds (RFC 9535 §2.3.5.2.2).
+        LogicalExpr::SingularLiteral { query, op, literal } => eval_singular(query, current, root)
+            .map_or(matches!(op, ast::ComparisonOp::Ne), |value| {
+                compare_values(value, *op, literal)
+            }),
         LogicalExpr::Existence(test) => match test {
             ExistenceTest::Singular(query) => eval_singular(query, current, root).is_some(),
             ExistenceTest::General(query) => !eval_filter_query(query, current, root).is_empty(),
@@ -484,6 +490,20 @@ fn eval_comparison<'a>(comparison: &Comparison, current: &'a Value, root: &'a Va
     let left = eval_comparable(&comparison.left, current, root);
     let right = eval_comparable(&comparison.right, current, root);
     compare(&left, comparison.op, &right)
+}
+
+/// Compares two present values directly — the [`LogicalExpr::SingularLiteral`] fast
+/// path, which never builds a [`Comparand`]. Semantics match [`compare`] for two
+/// `Value` operands.
+fn compare_values(left: &Value, op: ast::ComparisonOp, right: &Value) -> bool {
+    match op {
+        ast::ComparisonOp::Eq => value_eq(left, right),
+        ast::ComparisonOp::Ne => !value_eq(left, right),
+        ast::ComparisonOp::Lt => value_less(left, right),
+        ast::ComparisonOp::Le => value_less(left, right) || value_eq(left, right),
+        ast::ComparisonOp::Gt => value_less(right, left),
+        ast::ComparisonOp::Ge => value_less(right, left) || value_eq(left, right),
+    }
 }
 
 /// A comparison operand: a JSON value (borrowed from the document or owned for a

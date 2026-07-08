@@ -330,6 +330,8 @@ fn collect_pushdown_paths(expr: &LogicalExpr, paths: &mut Vec<Vec<String>>) -> b
         LogicalExpr::Comparison(comparison) => {
             comparable_paths(&comparison.left, paths) && comparable_paths(&comparison.right, paths)
         }
+        // The literal side consults no document path, so pushability is the query's alone.
+        LogicalExpr::SingularLiteral { query, .. } => singular_leaf_path(query, paths),
         LogicalExpr::Existence(test) => match test {
             ExistenceTest::Singular(query) => singular_leaf_path(query, paths),
             ExistenceTest::General(_) => false,
@@ -531,6 +533,7 @@ fn expr_has_root_query(expr: &LogicalExpr) -> bool {
         LogicalExpr::Comparison(comparison) => {
             comparable_has_root(&comparison.left) || comparable_has_root(&comparison.right)
         }
+        LogicalExpr::SingularLiteral { query, .. } => singular_has_root(query),
         LogicalExpr::Existence(test) => match test {
             ExistenceTest::Singular(query) => singular_has_root(query),
             ExistenceTest::General(query) => filter_query_has_root(query),

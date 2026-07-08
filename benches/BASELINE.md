@@ -360,6 +360,22 @@ ZST vanishes), while the fused continuation pays a `walk_from` call + segment ma
 selector-slice loop **per node** (~5–10 ns) on every high-fanout expansion. Rejected;
 the frontier walk stays.
 
+### Singular-vs-literal comparison fast path
+
+The dominant filter shape — a singular `@`-rooted query against a literal
+(`?@.price < 10`, `?@.category == 'fiction'`) — is now split out at lowering time
+(`LogicalExpr::SingularLiteral`; a `literal op query` source stores the mirrored
+operator). Evaluation is one member lookup plus an in-place `value_eq`/`value_less`,
+with no per-element `Comparand`/`Cow` construction or drop glue — machinery the
+filter profile put at ~28% of self time. Scan pushdown recognises the new node, so
+pushable predicates stay pushable (the scan differential suite covers it).
+
+A/B vs the clean post-lookup baseline @25k (quiet machine): **filter_string_eq
+−35%** (482 → 295 µs; −69% cumulative from the session start), **filter_comparison
+−7.7%** (587 µs; numeric compares are bounded by the lookup + `Number` unwrapping,
+not the wrappers); control rows within the ±7% layout-jitter band. Numeric-literal pre-decoding (skip the `as_i64/as_f64` chains
+per element) is the remaining known headroom on this shape.
+
 ### Frontier batching (tried, rejected)
 
 The follow-up hypothesis — make the frontier cheaper still via bulk insertion and
