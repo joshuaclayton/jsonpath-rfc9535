@@ -18,6 +18,7 @@ exclude = ["/benches", "/fuzz"]
 # transitively (the regex crate's own literal paths use it), so this adds no crates.
 memchr = { version = "2.8", optional = true }
 nom = "^8"
+rayon = { version = "1.12", optional = true }
 regex = { version = "1.12.4", optional = true }
 # `scan` only. rsonpath-lib 0.10 is what pins this crate's rust-version at 1.89.
 rsonpath-lib = { version = "0.10", optional = true }
@@ -66,6 +67,12 @@ default = ["regex"]
 # I-Regexp (RFC 9485) engine backed by the `regex` crate. Without this feature a
 # query that uses `match()`/`search()` is rejected by `JsonPath::parse`.
 regex = ["dep:memchr", "dep:regex"]
+# Parallelises `query_values` over large documents (arrays/frontiers of ≥2048
+# elements) on the rayon global pool: 4–9× wall-clock on 100k-element documents at
+# roughly 10× CPU. Small documents and the paths API (`query`) always take the
+# serial path — normalized paths share `Rc` links, which are not `Send`. Named
+# `rayon` per ecosystem convention (indexmap, hashbrown).
+rayon = ["dep:rayon"]
 # Hybrid byte-scanning evaluation over raw JSON text (`ScanQuery`): an rsonpath
 # engine extracts a structural query prefix from the raw bytes and the residual
 # (filters, tail segments) is evaluated per extracted fragment — no whole-document

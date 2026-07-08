@@ -412,6 +412,7 @@ dependencies = [
  "memchr",
  "nom 8.0.0",
  "proptest",
+ "rayon",
  "regex",
  "rsonpath-lib",
  "rsonpath-syntax",

@@ -71,12 +71,247 @@ pub fn evaluate<'a>(query: &Query, root: &'a Value) -> NodeList<'a> {
 }
 
 /// Evaluates `query` against `root`, returning just the selected values in order.
-/// Tracks no paths (`P = NoPath`), so traversal performs no path allocation.
+/// Tracks no paths (`P = NoPath`), so traversal performs no path allocation. With
+/// the `rayon` feature, work over large arrays/frontiers is parallelised (see
+/// `PAR_THRESHOLD`); results stay in document order via chunk-ordered concatenation.
 pub fn evaluate_values<'a>(query: &Query, root: &'a Value) -> Vec<&'a Value> {
-    walk(&query.segments, NoPath, root, root)
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect()
+    #[cfg(feature = "rayon")]
+    {
+        walk_par(&query.segments, root)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        walk(&query.segments, NoPath, root, root)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+}
+
+// ---- Parallel value-path evaluation (`rayon` feature) ----
+//
+// Only the value path (`P = NoPath`) parallelises: normalized paths share prefix
+// links via `Rc`, which is not `Send`, and the paths API keeps its serial walk
+// byte-for-byte. Everything here is read-only fan-out over `&Value` with
+// chunk-ordered concatenation, so per-query result order is identical to the serial
+// walk (the CTS harness cross-checks `query_values` against `query` on every case).
+
+/// Arrays and frontiers below this many elements are walked serially: fork/join and
+/// per-chunk buffers cost more than sub-millisecond work. At or above it, chunks go
+/// to the rayon pool.
+#[cfg(feature = "rayon")]
+const PAR_THRESHOLD: usize = 2048;
+
+/// Splits `len` items into roughly four chunks per worker thread — small enough to
+/// balance, large enough that per-chunk buffers stay amortised.
+#[cfg(feature = "rayon")]
+fn par_chunk_size(len: usize) -> usize {
+    (len / (rayon::current_num_threads().max(1) * 4)).max(512)
+}
+
+/// The value-path counterpart of [`walk`]: same segment-at-a-time frontier model,
+/// with large frontiers and large-array selector fan-outs dispatched to the pool.
+#[cfg(feature = "rayon")]
+fn walk_par<'a>(segments: &[Segment], root: &'a Value) -> Vec<(NoPath, &'a Value)> {
+    let mut nodes: Vec<(NoPath, &'a Value)> = vec![(NoPath, root)];
+    for segment in segments {
+        let mut next = Vec::with_capacity(nodes.len());
+        apply_segment_par(segment, &nodes, root, &mut next);
+        nodes = next;
+    }
+    nodes
+}
+
+#[cfg(feature = "rayon")]
+fn apply_segment_par<'a>(
+    segment: &Segment,
+    input: &[(NoPath, &'a Value)],
+    root: &'a Value,
+    out: &mut Vec<(NoPath, &'a Value)>,
+) {
+    use rayon::prelude::*;
+    // A large frontier parallelises regardless of segment kind: apply the segment per
+    // chunk with the ordinary serial applicators, then concatenate chunks in order.
+    if input.len() >= PAR_THRESHOLD {
+        let chunks: Vec<Vec<(NoPath, &'a Value)>> = input
+            .par_chunks(par_chunk_size(input.len()))
+            .map(|chunk| {
+                let mut local = Vec::with_capacity(chunk.len());
+                apply_segment(segment, chunk, root, &mut local);
+                local
+            })
+            .collect();
+        for mut chunk in chunks {
+            out.append(&mut chunk);
+        }
+        return;
+    }
+    match segment {
+        Segment::Child(selectors) => {
+            for (path, value) in input {
+                for selector in selectors {
+                    apply_selector_par(selector, *path, value, root, out);
+                }
+            }
+        }
+        Segment::Descendant(selectors) => {
+            for (_path, value) in input {
+                match selectors.as_slice() {
+                    [Selector::Name(name)] => descend_name_par(name, value, out),
+                    _ => descend_par(selectors, value, root, out),
+                }
+            }
+        }
+    }
+}
+
+/// Like [`apply_selector`], but a filter over a large array evaluates its predicate
+/// across the pool. The other selectors either do trivial per-node work (name,
+/// index, wildcard's pushes) or are rare (slice); they stay serial.
+#[cfg(feature = "rayon")]
+fn apply_selector_par<'a>(
+    selector: &Selector,
+    path: NoPath,
+    value: &'a Value,
+    root: &'a Value,
+    out: &mut Vec<(NoPath, &'a Value)>,
+) {
+    match selector {
+        Selector::Filter(expr) => apply_filter_par(expr, path, value, root, out),
+        Selector::Name(_) | Selector::Wildcard | Selector::Index(_) | Selector::Slice(_) => {
+            apply_selector(selector, &path, value, root, out);
+        }
+    }
+}
+
+#[cfg(feature = "rayon")]
+fn apply_filter_par<'a>(
+    expr: &LogicalExpr,
+    path: NoPath,
+    value: &'a Value,
+    root: &'a Value,
+    out: &mut Vec<(NoPath, &'a Value)>,
+) {
+    use rayon::prelude::*;
+    match value {
+        Value::Array(elements) if elements.len() >= PAR_THRESHOLD => {
+            let chunks: Vec<Vec<&'a Value>> = elements
+                .par_chunks(par_chunk_size(elements.len()))
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .filter(|element| eval_logical(expr, element, root))
+                        .collect()
+                })
+                .collect();
+            for chunk in chunks {
+                out.extend(chunk.into_iter().map(|element| (NoPath, element)));
+            }
+        }
+        Value::Array(_)
+        | Value::Object(_)
+        | Value::Null
+        | Value::Bool(_)
+        | Value::Number(_)
+        | Value::String(_) => apply_filter(expr, &path, value, root, out),
+    }
+}
+
+/// Parallel mirror of [`descend_name`]: identical order and pruning, but a large
+/// array fans its element subtrees out to the pool (each subtree recursing through
+/// the ordinary serial walk).
+#[cfg(feature = "rayon")]
+fn descend_name_par<'a>(name: &str, value: &'a Value, out: &mut Vec<(NoPath, &'a Value)>) {
+    use rayon::prelude::*;
+    match value {
+        Value::Object(members) => {
+            if let Some((_key, member)) = get_member(members, name) {
+                out.push((NoPath, member));
+            }
+            for (_key, member) in members {
+                if is_container(member) {
+                    descend_name_par(name, member, out);
+                }
+            }
+        }
+        Value::Array(elements) if elements.len() >= PAR_THRESHOLD => {
+            let chunks: Vec<Vec<(NoPath, &'a Value)>> = elements
+                .par_chunks(par_chunk_size(elements.len()))
+                .map(|chunk| {
+                    let mut local = Vec::new();
+                    for element in chunk {
+                        if is_container(element) {
+                            descend_name(name, &NoPath, element, &mut local);
+                        }
+                    }
+                    local
+                })
+                .collect();
+            for mut chunk in chunks {
+                out.append(&mut chunk);
+            }
+        }
+        Value::Array(elements) => {
+            for element in elements {
+                if is_container(element) {
+                    descend_name_par(name, element, out);
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+/// Parallel mirror of [`descend`] for the general selector list, with the same
+/// large-array fan-out as [`descend_name_par`].
+#[cfg(feature = "rayon")]
+fn descend_par<'a>(
+    selectors: &[Selector],
+    value: &'a Value,
+    root: &'a Value,
+    out: &mut Vec<(NoPath, &'a Value)>,
+) {
+    use rayon::prelude::*;
+    for selector in selectors {
+        apply_selector_par(selector, NoPath, value, root, out);
+    }
+    match value {
+        Value::Array(elements) if elements.len() >= PAR_THRESHOLD => {
+            let chunks: Vec<Vec<(NoPath, &'a Value)>> = elements
+                .par_chunks(par_chunk_size(elements.len()))
+                .map(|chunk| {
+                    let mut local = Vec::new();
+                    for element in chunk {
+                        if is_container(element) {
+                            descend(selectors, &NoPath, element, root, &mut local);
+                        }
+                    }
+                    local
+                })
+                .collect();
+            for mut chunk in chunks {
+                out.append(&mut chunk);
+            }
+        }
+        Value::Array(elements) => {
+            for element in elements {
+                if is_container(element) {
+                    descend_par(selectors, element, root, out);
+                }
+            }
+        }
+        Value::Object(members) => {
+            for (_key, member) in members {
+                if is_container(member) {
+                    descend_par(selectors, member, root, out);
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 /// Seam for the `scan` hybrid evaluator: threads `segments` from `start` (an extracted

@@ -414,6 +414,35 @@ stash-flipped, baseline-identical source, cold-start, quiet load, no thermal fla
 normal profile shape, then decayed on its own. If regex rows ever read +40…+110%
 against every code state at once, wait it out before believing anything.
 
+## Update 2026-07-08 — `rayon` feature: parallel value-path evaluation
+
+The value path (`query_values`) now parallelises over the rayon global pool behind an
+opt-in `rayon` feature (named per ecosystem convention — indexmap, hashbrown). Three
+dispatch points, all gated on ≥2048 elements: large frontiers (chunked through the
+ordinary serial applicators), filters over large arrays (predicate per chunk), and
+descendant recursion at large-array fan-outs (each subtree walked serially). Results
+keep exact document order via chunk-ordered concatenation — pinned by the CTS
+harness's `query_values`-vs-`query` cross-check on every case. The paths API and
+filter sub-queries stay serial (`NormalizedPath` shares `Rc` links, not `Send`);
+small documents never touch the pool (`small` fixture rows: ±6%).
+
+A/B vs the serial `main` baseline (13-worker M4 Pro, quiet):
+
+| query | 25k | 100k | 100k absolute |
+|---|---|---|---|
+| descendant | −76% | −82% | 8.45 ms → 1.55 ms |
+| filter_comparison | −75% | −84% | 5.25 ms → 844 µs |
+| filter_search | −76% | −86% | 8.92 ms → 1.23 ms |
+| filter_regex_dynamic | −85% | −89% | 14.4 ms → 1.61 ms |
+| descendant_wildcard | −69% | −73% | 11.7 ms → 3.15 ms |
+| wildcard | −38% | −74% | 1.71 ms → 446 µs |
+
+That is 4–9× wall-clock at ~10× CPU — the right trade for latency, the wrong one for
+saturated multi-tenant servers, hence opt-in. `just bench`/`bench-save-baseline` now
+measure `--features rayon` (the configuration of record); the cross-library
+`compare` bench deliberately stays serial so engine-vs-engine ratios remain
+single-core apples-to-apples, with this section carrying the parallel story.
+
 ### Frontier batching (tried, rejected)
 
 The follow-up hypothesis — make the frontier cheaper still via bulk insertion and
