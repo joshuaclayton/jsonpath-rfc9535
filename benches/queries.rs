@@ -86,6 +86,10 @@ fn documents() -> Vec<(&'static str, Value)> {
 const QUERIES: &[(&str, &str)] = &[
     ("child", "$.store.book[0].title"),
     ("wildcard", "$.store.book[*].author"),
+    // The slice selector was previously the only selector type with zero bench
+    // coverage — a speed regression there was invisible (the 101 CTS slice cases
+    // catch correctness only).
+    ("slice", "$.store.book[100:200:3].title"),
     ("descendant", "$..price"),
     ("filter_comparison", "$.store.book[?@.price < 10]"),
     ("filter_exists", "$.store.book[?@.isbn]"),

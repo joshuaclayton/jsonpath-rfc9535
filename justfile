@@ -70,6 +70,20 @@ bench *ARGS: bench-fixtures
 bench-compare *ARGS: bench-fixtures
   CRITERION_HOME={{ CRITERION_HOME }} cargo bench --features compare --bench comparison {{ ARGS }}
 
+# Spot-check both serde_json map backends (the in-repo suite can only measure
+# preserve_order/IndexMap — jsonpath_lib forces it; default users get BTreeMap).
+# Runs jsonpath-rfc9535 vs serde_json_path on each backend, ~2 min total.
+[group('bench')]
+bench-backends: bench-fixtures
+  cargo run --release --manifest-path benches/backend-harness/Cargo.toml
+  cargo run --release --manifest-path benches/backend-harness/Cargo.toml --features preserve_order
+
+# Same spot-check with jsonpath-rfc9535's parallel value path enabled.
+[group('bench')]
+bench-backends-rayon: bench-fixtures
+  cargo run --release --manifest-path benches/backend-harness/Cargo.toml --features rayon
+  cargo run --release --manifest-path benches/backend-harness/Cargo.toml --features preserve_order,rayon
+
 # Save the current numbers as the `main` baseline for future comparisons.
 [group('bench')]
 bench-save-baseline: bench-fixtures

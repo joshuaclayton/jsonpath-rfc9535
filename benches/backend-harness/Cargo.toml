@@ -1,0 +1,27 @@
+[package]
+name = "backend-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# A deliberately standalone crate (not a workspace member, like /fuzz): the point is
+# its dependency graph. The main repo's jsonpath_lib dev-dependency force-enables
+# serde_json/preserve_order (IndexMap + SipHash lookups) for every in-repo bench and
+# test build — so the criterion suite can only ever measure that backend. This
+# harness's graph has no such dependency, so a default build measures the BTreeMap
+# backend real default-feature users get; the `preserve_order` feature flips it back
+# for a same-harness comparison. jsonpath_lib must never be added here.
+
+[dependencies]
+jsonpath-rfc9535 = { path = "../.." }
+serde_json = "1.0"
+serde_json_path = "0.7.2"
+
+[features]
+# Measure the IndexMap backend (what the in-repo criterion suite measures).
+preserve_order = ["serde_json/preserve_order"]
+# Measure jsonpath-rfc9535's parallel value path.
+rayon = ["jsonpath-rfc9535/rayon"]
+
+[profile.release]
+debug = true
