@@ -443,6 +443,56 @@ measure `--features rayon` (the configuration of record); the cross-library
 `compare` bench deliberately stays serial so engine-vs-engine ratios remain
 single-core apples-to-apples, with this section carrying the parallel story.
 
+## Capstone 2026-07-09 — final read: git `main` vs this branch, all engines
+
+Measured on the trimmed suite, quiet machine, with cross-validation (the branch+rayon
+column reproduces the repo baseline within ±10% on every row; the git-main column
+reproduces two days of session history; five serial rows disturbed by overnight
+Spotlight/call noise were re-measured on a durably-quiet auto-run). The repo
+`.criterion` holds two baselines: **`main`** = branch HEAD (the go-forward
+reference, rayon-on queries config) and **`gitmain`** = git-main (d4678e4) imported
+rows — compare any time with `just bench -- --baseline-lenient gitmain`.
+
+### eval/ — query a parsed `Value`, compile-once (25k)
+
+| case | us @git-main | us serial | us +rayon | jsonpath_lib | serde_json_path | jsonpath-rust |
+|---|---|---|---|---|---|---|
+| child | 34 ns | 21 ns | **21 ns** | 214 ns | 216 ns | 325 ns |
+| author_wildcard | 658 µs | 222 µs | **124 µs** | 532 µs | 1.36 ms | 5.04 ms |
+| descendant_price | 2.14 ms | 1.38 ms | **390 µs** | 2.44 ms | 4.35 ms | 52.7 ms |
+| nested_wildcard | 2.19 ms | 1.97 ms | **527 µs** | 2.29 ms | 4.53 ms | 13.7 ms |
+| filter_cheap | 821 µs | 553 µs | **151 µs** | 1.81 ms | 889 µs | 3.63 ms |
+| filter_selective | n/a¹ | 105 ns | **109 ns** | 443 ns | 310 ns | 622 ns |
+| filter_search | 1.50 ms | 845 µs | **200 µs** | —² | 191.7 ms | 45.6 ms |
+
+At 100k the gaps widen: filter_cheap **833 µs** vs jsonpath_lib 12.8 ms (15×),
+filter_search **1.31 ms** vs serde_json_path 778.8 ms (**594×**) and jsonpath-rust
+199.4 ms (152×), descendant_price **1.62 ms** vs jsonpath-rust 204 ms (126×).
+¹ the case was added on this branch; ² jsonpath_lib has no regex functions.
+
+With rayon we lead every competitor on every case at both sizes (4–12× over
+jsonpath_lib, 2.8–594× over serde_json_path, 5.7–228× over jsonpath-rust); against
+our own git-main the branch is 1.5–2.6× serial (the algorithmic work: linear-scan
+lookups, filter IR fast path, plain patterns) and 3.6–7.3× with rayon at scale,
+while `child`/`filter_selective` correctly show the pool not engaging where there is
+nothing to parallelise. Queries-bench view of the same delta (serial): descendant
+−45%, filter_exists −38%, filter_function −47%, filter_search −36%,
+filter_string_eq −68%, filter_regex_dynamic −97%, descendant_wildcard ±5% (no name
+lookups — the control that stayed put).
+
+### extract/ — raw text → usable values (serial; hybrid is branch-only capability)
+
+| 25k | DOM parse+query | jsonpath_lib | rsonpath raw | hybrid adaptive |
+|---|---|---|---|---|
+| child | 29.1 ms | 29.0 ms | 1.19 ms | **1.20 ms** |
+| descendant_price | 30.1 ms | 31.2 ms | 3.20 ms | **3.11 ms** |
+| filter_cheap | 29.0 ms | 30.3 ms | — | **15.5 ms** |
+| filter_selective | 27.6 ms | 27.5 ms | — | **1.12 ms** (25×) |
+| filter_search | 29.4 ms | — | — | **23.4 ms** |
+
+Same shape at 1k and 100k: the hybrid rides rsonpath at cost parity wherever raw
+rsonpath can run, and is the only engine that evaluates filters over raw text at all.
+
 ### Bench-profile LTO (tried, rejected) and the suite trim
 
 `[profile.bench] lto = "thin", codegen-units = 1` was A/B'd on a 6-row subset with a
