@@ -184,6 +184,48 @@ test-doc-cfg: setup-nightly
 test-toml: setup-toml
   taplo fmt -c .taplo.toml --check
 
+# The minimum supported Rust version, read from Cargo.toml so this cannot drift.
+MSRV := `sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml`
+
+# Development happens on latest stable, which would otherwise let newer-than-MSRV
+# APIs slip in and break downstream users whom `rust-version` promised less suffices.
+# Verify the crate compiles on the minimum supported Rust version (from Cargo.toml)
+[group('test')]
+test-msrv:
+  rustup toolchain install {{ MSRV }} --profile minimal
+  cargo +{{ MSRV }} check --all-features
+  cargo +{{ MSRV }} check --no-default-features
+
+# `--all-targets` alone skips targets gated behind `required-features`, so without
+# this a lib API change could break the comparison bench and CI would stay green.
+# Compile-and-lint the cross-library comparison bench (feature `compare`)
+[group('test')]
+test-lint-compare:
+  cargo clippy --workspace --all-targets --features compare -- -D warnings
+
+# Both are standalone crates outside the workspace, so no other gate compiles them
+# and a lib API change could silently break them.
+# Compile-check the satellite crates (fuzz harness, backend bench harness)
+[group('test')]
+test-satellites:
+  cargo check --manifest-path fuzz/Cargo.toml
+  cargo check --manifest-path benches/backend-harness/Cargo.toml
+
+# Self-enforcing in both directions: this recipe is itself a ci dependency and a
+# matrix row, so a recipe added to one list but not the other fails the gate both
+# locally and on GitHub.
+# Fail when the GitHub workflow matrix and the `just ci` dependency list drift apart
+[group('test')]
+test-ci-sync:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  want=$(just --show ci | grep '^ci:' | sed 's/^ci: //' | tr ' ' '\n' | sort)
+  have=$(sed -n 's/^ *target: //p' .github/workflows/ci.yml | sort)
+  if ! diff <(echo "$want") <(echo "$have") >&2; then
+    echo "error: .github/workflows/ci.yml matrix != \`just ci\` dependencies (diff above: < ci deps, > matrix)" >&2
+    exit 1
+  fi
+
 # Run cargo audit
 [group('test')]
 test-audit: setup-audit
@@ -191,9 +233,11 @@ test-audit: setup-audit
 
 # Run every check CI runs; if this passes, it's ready to merge (coverage is separate: `just coverage`)
 [group('test')]
-ci: test-audit test-fmt test-lint test-lint-no-default test-lint-rayon test-lint-scan test test-no-default test-rayon test-scan test-doc test-doc-links test-doc-cfg test-toml
+ci: test-ci-sync test-audit test-fmt test-lint test-lint-no-default test-lint-rayon test-lint-scan test-lint-compare test test-no-default test-rayon test-scan test-msrv test-satellites test-doc test-doc-links test-doc-cfg test-toml verify-publish
 
-# Dry-run `cargo publish` to catch packaging problems before a real release
+# Catches exclude-rule, metadata, and .crate-build problems before a real release.
+# `--allow-dirty` keeps the gate usable mid-work; CI checkouts are clean anyway.
+# Dry-run `cargo publish` to catch packaging problems
 [group('cargo')]
 verify-publish:
   cargo publish --dry-run --allow-dirty
