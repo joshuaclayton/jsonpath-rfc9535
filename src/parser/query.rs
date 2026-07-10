@@ -14,16 +14,17 @@
 //! * There is no leading `S` before `root-identifier`: a query may not start with
 //!   whitespace.
 
+use super::ParseResult;
 use super::s;
 use super::segment::segment;
 use crate::ast::{Query, Segment};
+use nom::Parser;
 use nom::character::complete::char;
 use nom::multi::many0;
 use nom::sequence::preceded;
-use nom::{IResult, Parser};
 
 /// rule: `jsonpath-query = root-identifier segments`.
-pub fn query(input: &str) -> IResult<&str, Query> {
+pub fn query(input: &str) -> ParseResult<'_, Query> {
     let (input, _root) = char('$').parse(input)?;
     let (input, segments) = segments(input)?;
     Ok((input, Query { segments }))
@@ -31,7 +32,7 @@ pub fn query(input: &str) -> IResult<&str, Query> {
 
 /// rule: `segments = *(S segment)` — zero or more segments, each preceded by
 /// optional blank space.
-pub fn segments(input: &str) -> IResult<&str, Vec<Segment>> {
+pub fn segments(input: &str) -> ParseResult<'_, Vec<Segment>> {
     many0(preceded(s, segment)).parse(input)
 }
 

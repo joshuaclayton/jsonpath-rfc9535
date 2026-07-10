@@ -21,10 +21,11 @@
 //!   leading-zero query `$[01]` is rejected because the surrounding bracket is parsed
 //!   with `all_consuming`, not because `int` errors.
 //! * A valid integer that overflows `i64`, or one within `i64` but outside the
-//!   I-JSON safe range, both fail. (Range failures currently surface as
-//!   [`Error::Syntax`](crate::Error) rather than
-//!   [`Error::IntegerOutOfRange`](crate::Error): preserving the specific variant
-//!   through nom would require the parser to adopt a custom error type crate-wide.)
+//!   I-JSON safe range, both fail with [`Error::IntegerOutOfRange`], raised as a
+//!   [`nom::Err::Failure`] carrying the typed variant (see [`ParserError`]). A
+//!   `Failure` aborts alternation on purpose: once integer text has been consumed in
+//!   an index or slice position, the grammar admits no other reading of it, so the
+//!   specific error must not be masked by a sibling branch's generic one.
 //! * `number` (filter literals) is *not* range-restricted; the recognized text is
 //!   handed to `serde_json` to build the [`Number`]. Per ABNF case-insensitivity the
 //!   exponent marker may be `e` or `E`.
@@ -35,33 +36,30 @@
 //! the offset computation that is wrong). `recognize_len` reconstructs the matched
 //! slice from the input/remainder *lengths*, which is unaffected.
 
+use super::{ParseResult, ParserError};
 use crate::ast::JsonInt;
+use crate::error::Error;
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{char, digit0, digit1, one_of};
 use nom::combinator::{map_opt, opt};
 use nom::sequence::{pair, preceded};
-use nom::{IResult, Parser};
 use serde_json::Number;
 
 /// Like nom's `recognize`, but computes the consumed span from input/remainder
 /// lengths instead of pointer offsets, working around the nom 8.0.0 span bug
 /// described in the module docs. Requires the wrapped parser to leave a remainder
 /// that is a suffix of `input` (true for the combinators used here).
-fn recognize_len<'a, O, P>(mut parser: P) -> impl FnMut(&'a str) -> IResult<&'a str, &'a str>
+fn recognize_len<'a, O, P>(mut parser: P) -> impl FnMut(&'a str) -> ParseResult<'a, &'a str>
 where
-    P: Parser<&'a str, Output = O, Error = nom::error::Error<&'a str>>,
+    P: Parser<&'a str, Output = O, Error = ParserError<'a>>,
 {
     move |input: &'a str| {
         let (rest, _) = parser.parse(input)?;
         let consumed = input.len().saturating_sub(rest.len());
         input.get(..consumed).map_or_else(
-            || {
-                Err(nom::Err::Error(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::Fail,
-                )))
-            },
+            || Err(nom::Err::Error(ParserError::plain(input))),
             |matched| Ok((rest, matched)),
         )
     }
@@ -70,7 +68,7 @@ where
 /// rule: `int = "0" / (["-"] DIGIT1 *DIGIT)` — recognizes the integer *text* only.
 ///
 /// Shared with [`number`], which prepends this alternative to `"-0"`.
-fn int_text(input: &str) -> IResult<&str, &str> {
+fn int_text(input: &str) -> ParseResult<'_, &str> {
     alt((
         tag("0"),
         recognize_len(preceded(opt(char('-')), pair(one_of("123456789"), digit0))),
@@ -79,27 +77,40 @@ fn int_text(input: &str) -> IResult<&str, &str> {
 }
 
 /// rule: `int` — a decimal integer, range-checked into a [`JsonInt`].
-pub fn int(input: &str) -> IResult<&str, JsonInt> {
-    map_opt(int_text, |text: &str| {
-        text.parse::<i64>()
-            .ok()
-            .and_then(|value| JsonInt::new(value).ok())
-    })
-    .parse(input)
+///
+/// An integer that parses but lies outside the I-JSON safe range — or overflows
+/// `i64` outright — raises a [`nom::Err::Failure`] carrying
+/// [`Error::IntegerOutOfRange`]: in every position the grammar admits `int`, an
+/// out-of-range value has no alternative reading, so the failure is terminal and
+/// the typed variant survives to the caller (see the module docs).
+pub fn int(input: &str) -> ParseResult<'_, JsonInt> {
+    let (rest, text) = int_text(input)?;
+    let cause = match text.parse::<i64>() {
+        Ok(value) => match JsonInt::new(value) {
+            Ok(int) => return Ok((rest, int)),
+            Err(error) => error,
+        },
+        // Overflowing `i64` is a fortiori outside the safe range; the variant keeps
+        // the text form precisely because such values have no `i64` representation.
+        Err(_overflow) => Error::IntegerOutOfRange {
+            repr: text.to_owned(),
+        },
+    };
+    Err(nom::Err::Failure(ParserError::with_cause(input, cause)))
 }
 
 /// rule: `frac = "." 1*DIGIT`.
-fn frac(input: &str) -> IResult<&str, &str> {
+fn frac(input: &str) -> ParseResult<'_, &str> {
     recognize_len(pair(char('.'), digit1)).parse(input)
 }
 
 /// rule: `exp = "e" [ "-" / "+" ] 1*DIGIT` (the `e` is case-insensitive per ABNF).
-fn exp(input: &str) -> IResult<&str, &str> {
+fn exp(input: &str) -> ParseResult<'_, &str> {
     recognize_len(pair(one_of("eE"), pair(opt(one_of("+-")), digit1))).parse(input)
 }
 
 /// rule: `number = (int / "-0") [ frac ] [ exp ]` — a JSON number literal.
-pub fn number(input: &str) -> IResult<&str, Number> {
+pub fn number(input: &str) -> ParseResult<'_, Number> {
     map_opt(
         recognize_len(pair(alt((int_text, tag("-0"))), pair(opt(frac), opt(exp)))),
         |text: &str| serde_json::from_str::<Number>(text).ok(),
@@ -186,6 +197,24 @@ mod tests {
         assert!(
             int("9007199254740992").is_err(),
             "2^53 is outside the I-JSON safe integer range"
+        );
+    }
+
+    #[test]
+    fn out_of_range_int_is_a_terminal_failure_carrying_the_cause() {
+        // A `Failure` (not a recoverable `Error`) so alternation cannot mask the
+        // typed variant with a generic branch failure.
+        let result = int("9007199254740992");
+        assert!(
+            matches!(
+                &result,
+                Err(nom::Err::Failure(error))
+                    if error.cause
+                        == Some(crate::Error::IntegerOutOfRange {
+                            repr: "9007199254740992".to_owned(),
+                        })
+            ),
+            "expected Failure carrying IntegerOutOfRange, got {result:?}"
         );
     }
 

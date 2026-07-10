@@ -24,18 +24,19 @@
 //! surrogate-pair arithmetic RFC 9535 requires and that no parser library performs
 //! for you.
 
+use super::{ParseResult, ParserError};
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while_m_n};
 use nom::character::complete::{char, satisfy};
 use nom::combinator::{map_opt, value};
 use nom::multi::fold_many0;
 use nom::sequence::{delimited, preceded};
-use nom::{IResult, Parser};
 
 /// Builds a recoverable nom error positioned at `input` (used for the surrogate /
 /// scalar-validity failures the grammar requires).
-fn err(input: &str) -> nom::Err<nom::error::Error<&str>> {
-    nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Fail))
+const fn err(input: &str) -> nom::Err<ParserError<'_>> {
+    nom::Err::Error(ParserError::plain(input))
 }
 
 /// Combines a UTF-16 surrogate pair into a scalar value, or returns `None` if `low`
@@ -51,7 +52,7 @@ fn combine_surrogate(high: u16, low: u16) -> Option<char> {
 
 /// rule: `4HEXDIG` — exactly four hex digits, as a `u16`. Hex digits are
 /// case-insensitive per RFC 9535 §2.3.1.2.
-fn hex4(input: &str) -> IResult<&str, u16> {
+fn hex4(input: &str) -> ParseResult<'_, u16> {
     map_opt(
         take_while_m_n(4, 4, |c: char| c.is_ascii_hexdigit()),
         |digits: &str| u16::from_str_radix(digits, 16).ok(),
@@ -61,7 +62,7 @@ fn hex4(input: &str) -> IResult<&str, u16> {
 
 /// rule: `hexchar` (with the leading `\u` already consumed) — one Unicode scalar,
 /// combining a high surrogate with the `\u` low surrogate that must follow it.
-fn unicode(input: &str) -> IResult<&str, char> {
+fn unicode(input: &str) -> ParseResult<'_, char> {
     let (rest, high) = hex4(input)?;
     match high {
         0xD800..=0xDBFF => map_opt(preceded(tag(r"\u"), hex4), move |low| {
@@ -78,7 +79,7 @@ fn unicode(input: &str) -> IResult<&str, char> {
 /// rule: `ESC escapable` / `ESC %x22` / `ESC %x27` — one escape sequence, decoded to
 /// the character it denotes. Only the *active* quote `q` is escapable, so `\"` is
 /// invalid inside `'...'` (and `\'` is invalid inside `"..."`).
-fn escape(q: char) -> impl FnMut(&str) -> IResult<&str, char> {
+fn escape(q: char) -> impl FnMut(&str) -> ParseResult<'_, char> {
     move |input| {
         preceded(
             char('\\'),
@@ -100,12 +101,12 @@ fn escape(q: char) -> impl FnMut(&str) -> IResult<&str, char> {
 
 /// rule: `unescaped` — one literal character: anything except the active quote, the
 /// backslash, or a control character below `%x20`.
-fn unescaped(q: char) -> impl FnMut(&str) -> IResult<&str, char> {
+fn unescaped(q: char) -> impl FnMut(&str) -> ParseResult<'_, char> {
     move |input| satisfy(|c| c != q && c != '\\' && c >= '\u{20}').parse(input)
 }
 
 /// A complete quoted string using the quote character `q`, decoded to a `String`.
-fn quoted(q: char) -> impl FnMut(&str) -> IResult<&str, String> {
+fn quoted(q: char) -> impl FnMut(&str) -> ParseResult<'_, String> {
     move |input| {
         delimited(
             char(q),
@@ -121,7 +122,7 @@ fn quoted(q: char) -> impl FnMut(&str) -> IResult<&str, String> {
 
 /// rule: `name-selector = string-literal` — a single- or double-quoted, escape-decoded
 /// string.
-pub fn string_literal(input: &str) -> IResult<&str, String> {
+pub fn string_literal(input: &str) -> ParseResult<'_, String> {
     alt((quoted('"'), quoted('\''))).parse(input)
 }
 

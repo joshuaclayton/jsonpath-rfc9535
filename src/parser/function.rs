@@ -25,23 +25,24 @@
 //!   operator, negation, or parentheses stays [`FunctionArg::Logical`]. A bare
 //!   literal is not a `logical-expr`, so it falls through to the [`literal`] arm.
 
+use super::ParseResult;
 use super::filter::{literal, logical_expr};
 use super::s;
 use crate::ast::{FunctionArg, FunctionExpr, LogicalExpr};
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::take_while;
 use nom::character::complete::{char, satisfy};
 use nom::combinator::map;
 use nom::multi::separated_list0;
 use nom::sequence::{delimited, pair};
-use nom::{IResult, Parser};
 
 const fn is_function_name_char(c: char) -> bool {
     c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'
 }
 
 /// rule: `function-name` — a lowercase identifier (`[a-z][a-z0-9_]*`).
-pub fn function_name(input: &str) -> IResult<&str, String> {
+pub fn function_name(input: &str) -> ParseResult<'_, String> {
     let (rest, (first, tail)) = pair(
         satisfy(|c: char| c.is_ascii_lowercase()),
         take_while(is_function_name_char),
@@ -54,7 +55,7 @@ pub fn function_name(input: &str) -> IResult<&str, String> {
 }
 
 /// rule: `function-expr` — a function name applied to a parenthesized argument list.
-pub fn function_expr(input: &str) -> IResult<&str, FunctionExpr> {
+pub fn function_expr(input: &str) -> ParseResult<'_, FunctionExpr> {
     let (input, name) = function_name(input)?;
     let (input, args) = delimited(
         pair(char('('), s),
@@ -66,7 +67,7 @@ pub fn function_expr(input: &str) -> IResult<&str, FunctionExpr> {
 }
 
 /// rule: `function-argument` — one argument to a function call.
-pub fn function_argument(input: &str) -> IResult<&str, FunctionArg> {
+pub fn function_argument(input: &str) -> ParseResult<'_, FunctionArg> {
     alt((
         map(logical_expr, classify_logical),
         map(literal, FunctionArg::Literal),

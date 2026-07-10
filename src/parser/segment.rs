@@ -24,23 +24,24 @@
 //! * `member-name-shorthand` is an unquoted, unescaped identifier; it is built from
 //!   its first character and the run of following name characters (no `recognize`).
 
+use super::ParseResult;
 use super::s;
 use super::selector::{selector, wildcard};
 use crate::ast::{Segment, Selector};
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
 use nom::character::complete::{char, satisfy};
 use nom::combinator::map;
 use nom::multi::separated_list1;
 use nom::sequence::{delimited, pair, preceded};
-use nom::{IResult, Parser};
 
 /// rule: `segment = child-segment / descendant-segment`.
-pub fn segment(input: &str) -> IResult<&str, Segment> {
+pub fn segment(input: &str) -> ParseResult<'_, Segment> {
     alt((descendant_segment, child_segment)).parse(input)
 }
 
-fn child_segment(input: &str) -> IResult<&str, Segment> {
+fn child_segment(input: &str) -> ParseResult<'_, Segment> {
     alt((
         map(bracketed_selection, Segment::Child),
         map(preceded(char('.'), shorthand_selectors), Segment::Child),
@@ -48,7 +49,7 @@ fn child_segment(input: &str) -> IResult<&str, Segment> {
     .parse(input)
 }
 
-fn descendant_segment(input: &str) -> IResult<&str, Segment> {
+fn descendant_segment(input: &str) -> ParseResult<'_, Segment> {
     let (input, _dots) = tag("..").parse(input)?;
     let (input, selectors) = alt((bracketed_selection, shorthand_selectors)).parse(input)?;
     Ok((input, Segment::Descendant(selectors)))
@@ -56,7 +57,7 @@ fn descendant_segment(input: &str) -> IResult<&str, Segment> {
 
 /// `wildcard-selector / member-name-shorthand`, wrapped as a one-element selector
 /// list (the shared tail of both the `.`/`..` shorthand forms).
-fn shorthand_selectors(input: &str) -> IResult<&str, Vec<Selector>> {
+fn shorthand_selectors(input: &str) -> ParseResult<'_, Vec<Selector>> {
     alt((
         map(wildcard, |w| vec![w]),
         map(member_name_shorthand, |name| vec![Selector::Name(name)]),
@@ -68,7 +69,7 @@ fn shorthand_selectors(input: &str) -> IResult<&str, Vec<Selector>> {
 ///
 /// Returns the comma-separated selector list (used by both child and descendant
 /// segments). At least one selector is required.
-pub fn bracketed_selection(input: &str) -> IResult<&str, Vec<Selector>> {
+pub fn bracketed_selection(input: &str) -> ParseResult<'_, Vec<Selector>> {
     delimited(
         pair(char('['), s),
         separated_list1(delimited(s, char(','), s), selector),
@@ -86,7 +87,7 @@ const fn is_name_char(c: char) -> bool {
 }
 
 /// rule: `member-name-shorthand = name-first *name-char` — an unquoted member name.
-pub fn member_name_shorthand(input: &str) -> IResult<&str, String> {
+pub fn member_name_shorthand(input: &str) -> ParseResult<'_, String> {
     let (rest, (first, tail)) =
         pair(satisfy(is_name_first), take_while(is_name_char)).parse(input)?;
     let mut name = String::with_capacity(first.len_utf8() + tail.len());
