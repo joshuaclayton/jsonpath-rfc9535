@@ -34,7 +34,7 @@ use core::str::FromStr;
 use rsonpath::input::BorrowedBytes;
 use rsonpath::result::{Match, MatchSpan, Sink};
 use serde_json::Value;
-use split::{Plan, PushdownPlan, RootFreeSegments, ScanPlan};
+use split::{Plan, PushdownPlan, RootFreeSegments, ScanPlan, ScannableName};
 use std::fmt::{self, Display};
 
 /// How a [`ScanQuery`] chooses between the byte engine and a whole-document DOM parse.
@@ -335,8 +335,8 @@ fn run_scan_within_budget(plan: &ScanPlan, json_text: &str) -> BudgetOutcome {
 fn process_fragments(plan: &ScanPlan, matches: Vec<Match>) -> Result<Vec<Value>, ScanError> {
     let mut out = Vec::new();
     for found in matches {
-        let fragment: Value = serde_json::from_slice(found.bytes())
-            .map_err(|source| ScanError::InvalidFragment { source })?;
+        let fragment: Value =
+            serde_json::from_slice(found.bytes()).map_err(ScanError::invalid_fragment)?;
         if let Some(predicate) = &plan.predicate
             && !crate::eval::eval_logical(predicate.expr(), &fragment, &fragment)
         {
@@ -465,7 +465,7 @@ fn parse_candidate(bytes: &[u8], span: &MatchSpan) -> Result<Option<Value>, Scan
     };
     serde_json::from_slice(slice)
         .map(Some)
-        .map_err(|source| ScanError::InvalidFragment { source })
+        .map_err(ScanError::invalid_fragment)
 }
 
 /// Large candidate set: extract only the predicate's leaf values with auxiliary scans
@@ -553,7 +553,7 @@ fn assemble_synthetic(
             // on `ScanQuery::query_values`.
             found = Some(
                 serde_json::from_slice::<Value>(matched.bytes())
-                    .map_err(|source| ScanError::InvalidFragment { source })?,
+                    .map_err(ScanError::invalid_fragment)?,
             );
             *cursor += 1;
         }
@@ -575,21 +575,21 @@ fn assemble_synthetic(
 /// duplicated keys. A loop rather than recursion on purpose: path length is
 /// query-controlled, and iteration keeps hostile queries from turning placement into
 /// deep recursion.
-fn insert_leaf(target: &mut serde_json::Map<String, Value>, path: &[String], value: Value) {
+fn insert_leaf(target: &mut serde_json::Map<String, Value>, path: &[ScannableName], value: Value) {
     let Some((leaf_name, parents)) = path.split_last() else {
         return;
     };
     let mut current = target;
     for name in parents {
         let entry = current
-            .entry(name.clone())
+            .entry(name.as_str().to_owned())
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
         let Value::Object(inner) = entry else {
             return;
         };
         current = inner;
     }
-    current.insert(leaf_name.clone(), value);
+    current.insert(leaf_name.as_str().to_owned(), value);
 }
 
 /// A [`Sink`] that aborts the engine run once cumulative fragment bytes pass `budget`.
@@ -672,6 +672,15 @@ pub enum ScanError {
         /// of this crate's public API (its semver is not ours).
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+}
+
+impl ScanError {
+    /// Wraps a fragment-parse failure as [`ScanError::InvalidFragment`] — the one
+    /// conversion `From`-style wiring could not express, since
+    /// [`InvalidJson`](ScanError::InvalidJson) wraps the same source type.
+    const fn invalid_fragment(source: serde_json::Error) -> Self {
+        Self::InvalidFragment { source }
+    }
 }
 
 impl Display for ScanError {

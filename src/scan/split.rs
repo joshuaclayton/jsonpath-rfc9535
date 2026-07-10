@@ -89,7 +89,33 @@ pub struct LeafPlan {
     pub engine: RsonpathEngine,
     /// The member-name steps, used to place extracted values in the synthetic
     /// fragment (see [`LexOrderedLeaves`] for the ordering `insert_leaf` relies on).
-    pub path: Vec<String>,
+    pub path: Vec<ScannableName>,
+}
+
+/// A member name verified at construction to byte-match verbatim (see
+/// [`name_scans_verbatim`]): it contains no character JSON requires escaping, so
+/// the engine's plain byte comparison can actually find it in a document.
+///
+/// The verification matters because the engine compiler is *not* a backstop here —
+/// an escape-requiring name compiles fine and silently matches nothing.
+/// [`checked`](Self::checked) is the only constructor, so a leaf path holding these
+/// is proof the check ran; a future construction path cannot forget it.
+///
+/// Ordering is the inner string's lexicographic order, which is what
+/// [`LexOrderedLeaves`] sorts by.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScannableName(String);
+
+impl ScannableName {
+    /// Verifies and wraps `name`; `None` when the engine could never byte-match it.
+    fn checked(name: &str) -> Option<Self> {
+        name_scans_verbatim(name).then(|| Self(name.to_owned()))
+    }
+
+    /// The verified name, for rendering leaf queries and keying synthetic fragments.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// A pushdown plan's leaf scans, held in lexicographic path order — a path before any
@@ -321,7 +347,7 @@ fn build_pushdown(
 // else (general sub-queries, `count`/`value`, index steps, bare `@`) needs the real
 // fragment and falls back to the plain scan.
 
-fn collect_pushdown_paths(expr: &LogicalExpr, paths: &mut Vec<Vec<String>>) -> bool {
+fn collect_pushdown_paths(expr: &LogicalExpr, paths: &mut Vec<Vec<ScannableName>>) -> bool {
     match expr {
         LogicalExpr::Or(left, right) | LogicalExpr::And(left, right) => {
             collect_pushdown_paths(left, paths) && collect_pushdown_paths(right, paths)
@@ -341,7 +367,7 @@ fn collect_pushdown_paths(expr: &LogicalExpr, paths: &mut Vec<Vec<String>>) -> b
     }
 }
 
-fn comparable_paths(comparable: &Comparable, paths: &mut Vec<Vec<String>>) -> bool {
+fn comparable_paths(comparable: &Comparable, paths: &mut Vec<Vec<ScannableName>>) -> bool {
     match comparable {
         Comparable::Literal(_) => true,
         Comparable::Singular(query) => singular_leaf_path(query, paths),
@@ -349,7 +375,7 @@ fn comparable_paths(comparable: &Comparable, paths: &mut Vec<Vec<String>>) -> bo
     }
 }
 
-fn function_paths(function: &Function, paths: &mut Vec<Vec<String>>) -> bool {
+fn function_paths(function: &Function, paths: &mut Vec<Vec<ScannableName>>) -> bool {
     match function {
         Function::Length(arg) => value_arg_paths(arg, paths),
         // `count`/`value` take general (non-singular) sub-queries: not pushable.
@@ -362,14 +388,14 @@ fn function_paths(function: &Function, paths: &mut Vec<Vec<String>>) -> bool {
 }
 
 #[cfg(feature = "regex")]
-fn pattern_paths(pattern: &Pattern, paths: &mut Vec<Vec<String>>) -> bool {
+fn pattern_paths(pattern: &Pattern, paths: &mut Vec<Vec<ScannableName>>) -> bool {
     match pattern {
         Pattern::Plain(_) | Pattern::Substring(_) | Pattern::Literal(_) => true,
         Pattern::Dynamic(arg) => value_arg_paths(arg, paths),
     }
 }
 
-fn value_arg_paths(arg: &ValueArg, paths: &mut Vec<Vec<String>>) -> bool {
+fn value_arg_paths(arg: &ValueArg, paths: &mut Vec<Vec<ScannableName>>) -> bool {
     match arg {
         ValueArg::Literal(_) => true,
         ValueArg::Singular(query) => singular_leaf_path(query, paths),
@@ -382,7 +408,7 @@ fn value_arg_paths(arg: &ValueArg, paths: &mut Vec<Vec<String>>) -> bool {
 /// fragment without inventing sparse-array members (false existence); unscannable
 /// names cannot be byte-matched; and a bare `@` (empty path) would make the leaf scan
 /// re-extract every candidate — exactly what pushdown exists to avoid.
-fn singular_leaf_path(query: &ast::SingularQuery, paths: &mut Vec<Vec<String>>) -> bool {
+fn singular_leaf_path(query: &ast::SingularQuery, paths: &mut Vec<Vec<ScannableName>>) -> bool {
     if matches!(query.root, ast::QueryRoot::Root) || query.segments.is_empty() {
         return false;
     }
@@ -390,10 +416,10 @@ fn singular_leaf_path(query: &ast::SingularQuery, paths: &mut Vec<Vec<String>>) 
     for segment in &query.segments {
         match segment {
             ast::SingularSegment::Name(name) => {
-                if !name_scans_verbatim(name) {
+                let Some(name) = ScannableName::checked(name) else {
                     return false;
-                }
-                path.push(name.clone());
+                };
+                path.push(name);
             }
             ast::SingularSegment::Index(_) => return false,
         }
@@ -457,7 +483,10 @@ fn render_prefix(
 
 /// Renders a pushdown leaf query: the prefix, the filter's `[*]`, then the leaf's
 /// member-name steps.
-fn render_leaf(prefix: &[Segment], path: &[String]) -> Option<rsonpath_syntax::JsonPathQuery> {
+fn render_leaf(
+    prefix: &[Segment],
+    path: &[ScannableName],
+) -> Option<rsonpath_syntax::JsonPathQuery> {
     let mut builder = prefix_builder(prefix)?;
     builder.child_wildcard();
     for name in path {
@@ -592,7 +621,7 @@ fn filter_query_has_root(query: &crate::compiled::FilterQuery) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{LeafPlan, LexOrderedLeaves, Plan, split};
+    use super::{LeafPlan, LexOrderedLeaves, Plan, ScannableName, split};
     use crate::JsonPath;
     use rsonpath::engine::{Compiler, RsonpathEngine};
 
@@ -860,7 +889,7 @@ mod tests {
         let path = |names: &[&str]| {
             names
                 .iter()
-                .map(|&name| name.to_owned())
+                .map(|&name| ScannableName::checked(name).expect("test name must be scannable"))
                 .collect::<Vec<_>>()
         };
         let shuffled = vec![
@@ -877,7 +906,7 @@ mod tests {
                 path: path(&["a"]),
             },
         ];
-        let ordered: Vec<Vec<String>> = LexOrderedLeaves::sorted(shuffled)
+        let ordered: Vec<Vec<ScannableName>> = LexOrderedLeaves::sorted(shuffled)
             .iter()
             .map(|leaf| leaf.path.clone())
             .collect();
