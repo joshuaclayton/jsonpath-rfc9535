@@ -36,7 +36,7 @@ use nom::sequence::{delimited, preceded};
 /// Builds a recoverable nom error positioned at `input` (used for the surrogate /
 /// scalar-validity failures the grammar requires).
 const fn err(input: &str) -> nom::Err<ParserError<'_>> {
-    nom::Err::Error(ParserError::plain(input))
+    nom::Err::Error(ParserError::Plain(input))
 }
 
 /// Combines a UTF-16 surrogate pair into a scalar value, or returns `None` if `low`

@@ -535,3 +535,28 @@ at 25k: child **20.9 ns vs 322 ns** (15×), author_wildcard **208 µs vs 5.21 ms
 our `query_values` row does not — but `micro/path_overhead` puts our paths API at
 2–3× the values API on these shapes, which still leaves every row several times
 ahead of jsonpath-rust.
+
+## 2026-07-10 — parser error type: keep it as cheap as nom's own (cleanup branch)
+
+The typed-error work (surfacing `Error::IntegerOutOfRange` through nom) initially
+carried an owned crate `Error` inside the parser's custom error type, and `parse/*`
+paid for it — a lesson worth recording because it generalizes: **combinators
+construct and discard error values on every backtracking `alt` branch, so the error
+type's width and drop glue tax every return, success paths included** (`Result` is
+as wide as its widest variant).
+
+Measured against the `main` baseline (M4 Pro, moderate background load — a
+same-session control leg on unchanged code read +0.6…+11% row-dependent drift, so
+deltas below are paired with that control):
+
+| design | `parse/*` vs baseline |
+|---|---|
+| `Option<Error>` inline (56-byte error) | **+7…+33%**, worst on filter rows |
+| `Option<Box<Error>>` (24 B, but drop glue) | **+6…+11% real** on filter rows (control-adjusted) — drop glue forces every discarded branch error to be checked |
+| `Copy` enum borrowing the offending literal (24 B, no glue) | **at/below baseline**: slice −5%, filter_search −4%, regex rows −3…−4%, rest within the day's control band |
+
+The landed shape mirrors the borrowed-normalized-path-names move: the error carries
+`&str` slices of the query; the owned `Error` is materialized once, in
+`map_nom_error`, on the already-failed path. The nesting-depth pre-scan is likewise
+skipped for input ≤ 128 bytes (cannot nest past the limit by construction), so
+ordinary queries never pay for it.
