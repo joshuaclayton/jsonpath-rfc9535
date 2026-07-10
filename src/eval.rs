@@ -112,6 +112,31 @@ fn par_chunk_size(len: usize) -> usize {
     (len / (rayon::current_num_threads().max(1) * 4)).max(512)
 }
 
+/// Chunk-ordered parallel fan-out — the one shape every parallel applicator shares:
+/// splits `items` into ~4 chunks per worker (see [`par_chunk_size`]), materialises
+/// each chunk's selections on the rayon pool with `per_chunk`, and appends the chunk
+/// results to `out` in chunk order. Chunks partition `items` in order, so the
+/// concatenation preserves document order exactly as the serial walk would emit it.
+///
+/// Two lifetimes on purpose: the selected values borrow the document (`'a`), while
+/// `items` may be a shorter-lived frontier slice whose *elements* borrow the
+/// document (`apply_segment_par`) or the document's own arrays (`'b = 'a`).
+#[cfg(feature = "rayon")]
+fn par_fanout<'a, 'b, T: Sync>(
+    items: &'b [T],
+    out: &mut Vec<(NoPath, &'a Value)>,
+    per_chunk: impl Fn(&'b [T]) -> Vec<(NoPath, &'a Value)> + Send + Sync,
+) {
+    use rayon::prelude::*;
+    let chunks: Vec<Vec<(NoPath, &'a Value)>> = items
+        .par_chunks(par_chunk_size(items.len()))
+        .map(per_chunk)
+        .collect();
+    for mut chunk in chunks {
+        out.append(&mut chunk);
+    }
+}
+
 /// The value-path counterpart of [`walk`]: same segment-at-a-time frontier model,
 /// with large frontiers and large-array selector fan-outs dispatched to the pool.
 #[cfg(feature = "rayon")]
@@ -132,21 +157,14 @@ fn apply_segment_par<'a>(
     root: &'a Value,
     out: &mut Vec<(NoPath, &'a Value)>,
 ) {
-    use rayon::prelude::*;
     // A large frontier parallelises regardless of segment kind: apply the segment per
     // chunk with the ordinary serial applicators, then concatenate chunks in order.
     if input.len() >= PAR_THRESHOLD {
-        let chunks: Vec<Vec<(NoPath, &'a Value)>> = input
-            .par_chunks(par_chunk_size(input.len()))
-            .map(|chunk| {
-                let mut local = Vec::with_capacity(chunk.len());
-                apply_segment(segment, chunk, root, &mut local);
-                local
-            })
-            .collect();
-        for mut chunk in chunks {
-            out.append(&mut chunk);
-        }
+        par_fanout(input, out, |chunk| {
+            let mut local = Vec::with_capacity(chunk.len());
+            apply_segment(segment, chunk, root, &mut local);
+            local
+        });
         return;
     }
     match segment {
@@ -195,21 +213,15 @@ fn apply_filter_par<'a>(
     root: &'a Value,
     out: &mut Vec<(NoPath, &'a Value)>,
 ) {
-    use rayon::prelude::*;
     match value {
         Value::Array(elements) if elements.len() >= PAR_THRESHOLD => {
-            let chunks: Vec<Vec<&'a Value>> = elements
-                .par_chunks(par_chunk_size(elements.len()))
-                .map(|chunk| {
-                    chunk
-                        .iter()
-                        .filter(|element| eval_logical(expr, element, root))
-                        .collect()
-                })
-                .collect();
-            for chunk in chunks {
-                out.extend(chunk.into_iter().map(|element| (NoPath, element)));
-            }
+            par_fanout(elements, out, |chunk| {
+                chunk
+                    .iter()
+                    .filter(|element| eval_logical(expr, element, root))
+                    .map(|element| (NoPath, element))
+                    .collect()
+            });
         }
         Value::Array(_)
         | Value::Object(_)
@@ -225,7 +237,6 @@ fn apply_filter_par<'a>(
 /// the ordinary serial walk).
 #[cfg(feature = "rayon")]
 fn descend_name_par<'a>(name: &str, value: &'a Value, out: &mut Vec<(NoPath, &'a Value)>) {
-    use rayon::prelude::*;
     match value {
         Value::Object(members) => {
             if let Some((_key, member)) = get_member(members, name) {
@@ -238,21 +249,15 @@ fn descend_name_par<'a>(name: &str, value: &'a Value, out: &mut Vec<(NoPath, &'a
             }
         }
         Value::Array(elements) if elements.len() >= PAR_THRESHOLD => {
-            let chunks: Vec<Vec<(NoPath, &'a Value)>> = elements
-                .par_chunks(par_chunk_size(elements.len()))
-                .map(|chunk| {
-                    let mut local = Vec::new();
-                    for element in chunk {
-                        if is_container(element) {
-                            descend_name(name, &NoPath, element, &mut local);
-                        }
+            par_fanout(elements, out, |chunk| {
+                let mut local = Vec::new();
+                for element in chunk {
+                    if is_container(element) {
+                        descend_name(name, &NoPath, element, &mut local);
                     }
-                    local
-                })
-                .collect();
-            for mut chunk in chunks {
-                out.append(&mut chunk);
-            }
+                }
+                local
+            });
         }
         Value::Array(elements) => {
             for element in elements {
@@ -274,27 +279,20 @@ fn descend_par<'a>(
     root: &'a Value,
     out: &mut Vec<(NoPath, &'a Value)>,
 ) {
-    use rayon::prelude::*;
     for selector in selectors {
         apply_selector_par(selector, NoPath, value, root, out);
     }
     match value {
         Value::Array(elements) if elements.len() >= PAR_THRESHOLD => {
-            let chunks: Vec<Vec<(NoPath, &'a Value)>> = elements
-                .par_chunks(par_chunk_size(elements.len()))
-                .map(|chunk| {
-                    let mut local = Vec::new();
-                    for element in chunk {
-                        if is_container(element) {
-                            descend(selectors, &NoPath, element, root, &mut local);
-                        }
+            par_fanout(elements, out, |chunk| {
+                let mut local = Vec::new();
+                for element in chunk {
+                    if is_container(element) {
+                        descend(selectors, &NoPath, element, root, &mut local);
                     }
-                    local
-                })
-                .collect();
-            for mut chunk in chunks {
-                out.append(&mut chunk);
-            }
+                }
+                local
+            });
         }
         Value::Array(elements) => {
             for element in elements {
