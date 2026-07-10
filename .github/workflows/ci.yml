@@ -14,20 +14,32 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: CI sync (matrix == just ci)
+            target: test-ci-sync
           - name: Format
             target: test-fmt
           - name: Clippy
             target: test-lint
           - name: Clippy (no default features)
             target: test-lint-no-default
+          - name: Clippy (rayon feature)
+            target: test-lint-rayon
           - name: Clippy (scan feature)
             target: test-lint-scan
+          - name: Clippy (comparison bench)
+            target: test-lint-compare
           - name: Test Suite
             target: test
           - name: Test Suite (no default features)
             target: test-no-default
+          - name: Test Suite (rayon feature)
+            target: test-rayon
           - name: Test Suite (scan feature)
             target: test-scan
+          - name: MSRV
+            target: test-msrv
+          - name: Satellite crates
+            target: test-satellites
           - name: Docs
             target: test-doc
           - name: Doc Links
@@ -38,6 +50,8 @@ jobs:
             target: test-toml
           - name: Audit
             target: test-audit
+          - name: Publish dry run
+            target: verify-publish
 
     steps:
       - uses: actions/checkout@v4
