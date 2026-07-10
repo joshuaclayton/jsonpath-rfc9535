@@ -18,18 +18,19 @@
 //! * `name-selector` delegates to [`string_literal`], the slice to [`slice()`], the index
 //!   to [`int`], and the filter to [`filter_selector`].
 
+use super::ParseResult;
 use super::filter::filter_selector;
 use super::number::int;
 use super::slice::slice;
 use super::string::string_literal;
 use crate::ast::Selector;
+use nom::Parser;
 use nom::branch::alt;
 use nom::character::complete::char;
 use nom::combinator::{map, value};
-use nom::{IResult, Parser};
 
 /// rule: `selector` — any one of the five selector kinds.
-pub fn selector(input: &str) -> IResult<&str, Selector> {
+pub fn selector(input: &str) -> ParseResult<'_, Selector> {
     alt((
         map(string_literal, Selector::Name),
         wildcard,
@@ -41,7 +42,7 @@ pub fn selector(input: &str) -> IResult<&str, Selector> {
 }
 
 /// rule: `wildcard-selector = "*"`.
-pub fn wildcard(input: &str) -> IResult<&str, Selector> {
+pub fn wildcard(input: &str) -> ParseResult<'_, Selector> {
     value(Selector::Wildcard, char('*')).parse(input)
 }
 

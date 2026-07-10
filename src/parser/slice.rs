@@ -17,16 +17,17 @@
 //!   `step`) are applied during evaluation, not here, so missing components stay
 //!   `None` in the resulting [`Slice`].
 
+use super::ParseResult;
 use super::number::int;
 use super::s;
 use crate::ast::Slice;
+use nom::Parser;
 use nom::character::complete::char;
 use nom::combinator::opt;
 use nom::sequence::{preceded, terminated};
-use nom::{IResult, Parser};
 
 /// rule: `slice-selector` — `start:end:step` with all parts optional.
-pub fn slice(input: &str) -> IResult<&str, Slice> {
+pub fn slice(input: &str) -> ParseResult<'_, Slice> {
     let (input, start) = opt(terminated(int, s)).parse(input)?;
     let (input, _colon) = char(':').parse(input)?;
     let (input, _ws) = s(input)?;

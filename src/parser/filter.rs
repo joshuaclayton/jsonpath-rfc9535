@@ -36,6 +36,7 @@
 //! * `true`/`false`/`null` are matched only when not followed by a function-name
 //!   character, so they are not mistaken for the prefix of a function name.
 
+use super::ParseResult;
 use super::function::function_expr;
 use super::number::{int, number};
 use super::query::segments;
@@ -46,27 +47,27 @@ use crate::ast::{
     Comparable, Comparison, ComparisonOp, FilterQuery, Literal, LogicalExpr, QueryRoot,
     SingularQuery, SingularSegment,
 };
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{char, satisfy};
 use nom::combinator::{map, not, opt, value};
 use nom::multi::many0;
 use nom::sequence::{delimited, pair, preceded, terminated};
-use nom::{IResult, Parser};
 
 /// rule: `filter-selector = "?" S logical-expr` — returns the logical expression
 /// (the leading `?` is consumed here).
-pub fn filter_selector(input: &str) -> IResult<&str, LogicalExpr> {
+pub fn filter_selector(input: &str) -> ParseResult<'_, LogicalExpr> {
     preceded(pair(char('?'), s), logical_expr).parse(input)
 }
 
 /// rule: `logical-expr = logical-or-expr`.
-pub fn logical_expr(input: &str) -> IResult<&str, LogicalExpr> {
+pub fn logical_expr(input: &str) -> ParseResult<'_, LogicalExpr> {
     logical_or_expr(input)
 }
 
 /// rule: `logical-or-expr = logical-and-expr *(S "||" S logical-and-expr)`.
-fn logical_or_expr(input: &str) -> IResult<&str, LogicalExpr> {
+fn logical_or_expr(input: &str) -> ParseResult<'_, LogicalExpr> {
     let (input, first) = logical_and_expr(input)?;
     let (input, rest) =
         many0(preceded(delimited(s, tag("||"), s), logical_and_expr)).parse(input)?;
@@ -77,7 +78,7 @@ fn logical_or_expr(input: &str) -> IResult<&str, LogicalExpr> {
 }
 
 /// rule: `logical-and-expr = basic-expr *(S "&&" S basic-expr)`.
-fn logical_and_expr(input: &str) -> IResult<&str, LogicalExpr> {
+fn logical_and_expr(input: &str) -> ParseResult<'_, LogicalExpr> {
     let (input, first) = basic_expr(input)?;
     let (input, rest) = many0(preceded(delimited(s, tag("&&"), s), basic_expr)).parse(input)?;
     let expr = rest.into_iter().fold(first, |acc, next| {
@@ -87,7 +88,7 @@ fn logical_and_expr(input: &str) -> IResult<&str, LogicalExpr> {
 }
 
 /// rule: `basic-expr = paren-expr / comparison-expr / test-expr`.
-fn basic_expr(input: &str) -> IResult<&str, LogicalExpr> {
+fn basic_expr(input: &str) -> ParseResult<'_, LogicalExpr> {
     alt((
         paren_expr,
         map(comparison, LogicalExpr::Comparison),
@@ -97,7 +98,7 @@ fn basic_expr(input: &str) -> IResult<&str, LogicalExpr> {
 }
 
 /// rule: `paren-expr = [logical-not-op S] "(" S logical-expr S ")"`.
-fn paren_expr(input: &str) -> IResult<&str, LogicalExpr> {
+fn paren_expr(input: &str) -> ParseResult<'_, LogicalExpr> {
     let (input, negated) = opt(terminated(char('!'), s)).parse(input)?;
     let (input, inner) =
         delimited(pair(char('('), s), logical_expr, pair(s, char(')'))).parse(input)?;
@@ -105,7 +106,7 @@ fn paren_expr(input: &str) -> IResult<&str, LogicalExpr> {
 }
 
 /// rule: `test-expr = [logical-not-op S] (filter-query / function-expr)`.
-fn test_expr(input: &str) -> IResult<&str, LogicalExpr> {
+fn test_expr(input: &str) -> ParseResult<'_, LogicalExpr> {
     let (input, negated) = opt(terminated(char('!'), s)).parse(input)?;
     let (input, inner) = alt((
         map(filter_query, LogicalExpr::Existence),
@@ -124,7 +125,7 @@ fn negate_if(negated: bool, expr: LogicalExpr) -> LogicalExpr {
 }
 
 /// rule: `comparison-expr = comparable S comparison-op S comparable`.
-pub fn comparison(input: &str) -> IResult<&str, Comparison> {
+pub fn comparison(input: &str) -> ParseResult<'_, Comparison> {
     let (input, left) = comparable(input)?;
     let (input, _lws) = s(input)?;
     let (input, op) = comparison_op(input)?;
@@ -134,7 +135,7 @@ pub fn comparison(input: &str) -> IResult<&str, Comparison> {
 }
 
 /// rule: `comparison-op = "==" / "!=" / "<=" / ">=" / "<" / ">"`.
-pub fn comparison_op(input: &str) -> IResult<&str, ComparisonOp> {
+pub fn comparison_op(input: &str) -> ParseResult<'_, ComparisonOp> {
     alt((
         value(ComparisonOp::Eq, tag("==")),
         value(ComparisonOp::Ne, tag("!=")),
@@ -147,7 +148,7 @@ pub fn comparison_op(input: &str) -> IResult<&str, ComparisonOp> {
 }
 
 /// rule: `comparable = literal / singular-query / function-expr`.
-pub fn comparable(input: &str) -> IResult<&str, Comparable> {
+pub fn comparable(input: &str) -> ParseResult<'_, Comparable> {
     alt((
         map(literal, Comparable::Literal),
         map(singular_query, Comparable::SingularQuery),
@@ -157,7 +158,7 @@ pub fn comparable(input: &str) -> IResult<&str, Comparable> {
 }
 
 /// rule: `literal = number / string-literal / true / false / null`.
-pub fn literal(input: &str) -> IResult<&str, Literal> {
+pub fn literal(input: &str) -> ParseResult<'_, Literal> {
     alt((
         map(number, Literal::Number),
         map(string_literal, Literal::String),
@@ -170,7 +171,7 @@ pub fn literal(input: &str) -> IResult<&str, Literal> {
 
 /// Matches the keyword `word` only when it is not immediately followed by a
 /// function-name character, so a keyword is never read as the prefix of a longer name.
-fn keyword(word: &'static str) -> impl FnMut(&str) -> IResult<&str, &str> {
+fn keyword(word: &'static str) -> impl FnMut(&str) -> ParseResult<'_, &str> {
     move |input| {
         terminated(
             tag(word),
@@ -183,14 +184,14 @@ fn keyword(word: &'static str) -> impl FnMut(&str) -> IResult<&str, &str> {
 }
 
 /// rule: `singular-query` — a query selecting at most one node.
-pub fn singular_query(input: &str) -> IResult<&str, SingularQuery> {
+pub fn singular_query(input: &str) -> ParseResult<'_, SingularQuery> {
     let (input, root) = query_root(input)?;
     let (input, segments) = many0(preceded(s, singular_segment)).parse(input)?;
     Ok((input, SingularQuery { root, segments }))
 }
 
 /// `name-segment / index-segment` — a single name or index step.
-fn singular_segment(input: &str) -> IResult<&str, SingularSegment> {
+fn singular_segment(input: &str) -> ParseResult<'_, SingularSegment> {
     alt((
         delimited(
             char('['),
@@ -210,14 +211,14 @@ fn singular_segment(input: &str) -> IResult<&str, SingularSegment> {
 
 /// rule: `filter-query = rel-query / jsonpath-query` — a relative (`@`) or absolute
 /// (`$`) query usable as an existence test or function argument.
-pub fn filter_query(input: &str) -> IResult<&str, FilterQuery> {
+pub fn filter_query(input: &str) -> ParseResult<'_, FilterQuery> {
     let (input, root) = query_root(input)?;
     let (input, segments) = segments(input)?;
     Ok((input, FilterQuery { root, segments }))
 }
 
 /// `current-node-identifier / root-identifier` — `@` or `$`.
-fn query_root(input: &str) -> IResult<&str, QueryRoot> {
+fn query_root(input: &str) -> ParseResult<'_, QueryRoot> {
     alt((
         value(QueryRoot::Current, char('@')),
         value(QueryRoot::Root, char('$')),

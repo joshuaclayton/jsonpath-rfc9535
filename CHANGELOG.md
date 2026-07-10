@@ -11,6 +11,9 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   filter selectors; child and descendant segments; and the `length`, `count`, `value`,
   `match`, and `search` functions (`match`/`search` behind the default `regex` feature).
 - Normalized paths (RFC 9535 §2.7) for each selected node.
+- Out-of-range array indexes and slice bounds are rejected with
+  `Error::IntegerOutOfRange`, carrying the offending integer text verbatim, rather
+  than a generic syntax error.
 - Conformance verified against the JSONPath Compliance Test Suite.
 - A `jp` command-line tool (installed via `cargo install jsonpath-rfc9535`) that queries JSON from a file or stdin.
 - An experimental `scan` feature: `ScanQuery` evaluates queries over raw JSON text by
