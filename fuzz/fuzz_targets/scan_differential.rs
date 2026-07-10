@@ -19,24 +19,8 @@ use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
 use std::sync::LazyLock;
 
-/// One query per plan shape the splitter produces (mirrors tests/scan_properties.rs).
-const QUERIES: &[&str] = &[
-    "$.a.b",              // singular full scan
-    "$..a",               // descendant full scan (adaptive budget in play)
-    "$.a[*].b",           // wildcard full scan
-    "$.a[0]",             // index full scan
-    "$.a[?@.n > 3]",      // pushdown, comparison leaf
-    "$.a[?@.n].b",        // pushdown + residual
-    "$.a[?@.b && @.b.k]", // pushdown, overlapping leaves
-    "$[?@.x]",            // pushdown at the root
-    "$.a[?@.b[*]]",       // plain scan with predicate
-    "$..a[?@.n]",         // plain scan with predicate, descendant prefix
-    "$.a[?@ > 1]",        // plain scan with predicate, bare `@`
-    "$.a[1:3]",           // slice in the residual
-    "$.a[-1]",            // negative index in the residual
-    "$[-1]",              // unsplittable: DOM fallback
-    "$[*]",               // whole-document prefix
-];
+// The plan-shape query pool, shared verbatim with `tests/scan_properties.rs`.
+include!("../../tests/common/plan_shape_queries.rs");
 
 /// Compiled once per process: (scan query, DOM oracle, has descendant segment).
 static COMPILED: LazyLock<Vec<(ScanQuery, JsonPath, bool)>> = LazyLock::new(|| {
