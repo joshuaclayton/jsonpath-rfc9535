@@ -24,8 +24,9 @@ impl JsonPath {
     /// # Errors
     ///
     /// Returns an [`Error`] if `query` is not syntactically valid JSONPath, contains
-    /// an out-of-range integer, or uses a function extension that is unregistered,
-    /// has the wrong arity, or is not well-typed.
+    /// an out-of-range integer, nests brackets or parentheses deeper than the
+    /// supported limit (128 levels — far beyond any real query), or uses a function
+    /// extension that is unregistered, has the wrong arity, or is not well-typed.
     ///
     /// # Examples
     ///
