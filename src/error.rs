@@ -24,12 +24,26 @@ pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 /// See [`MAX_SAFE_INTEGER`] for details.
 pub const MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
 
+/// The maximum bracket/parenthesis nesting depth a query may use.
+///
+/// The parser recurses once per nested filter (`[?…]`), parenthesized filter
+/// expression, and function call, so unbounded nesting would let a ~10 kB hostile
+/// query overflow the stack — a process abort, not a catchable panic. Real queries
+/// never approach this limit: the deepest compliance-suite case nests 4 levels.
+/// The value matches `serde_json`'s default document recursion limit and sits
+/// several times below the measured overflow point in debug builds (the tighter
+/// configuration). Only *simultaneous* nesting counts — sequential segments
+/// (`$[0][1]…`) are parsed iteratively and are unlimited.
+pub const MAX_NESTING_DEPTH: usize = 128;
+
 /// An error produced while compiling a JSONPath query string into a runnable query.
 ///
 /// Errors fall into two broad categories:
 ///
-/// * **Syntax** — the query does not conform to the RFC 9535 grammar
-///   ([`Error::Syntax`], [`Error::IntegerOutOfRange`]).
+/// * **Syntax** — the query text is unacceptable: it does not conform to the
+///   RFC 9535 grammar ([`Error::Syntax`]), an index or slice bound is out of range
+///   ([`Error::IntegerOutOfRange`]), or it nests deeper than the parser supports
+///   ([`Error::NestingTooDeep`]).
 /// * **Well-typedness** — the query parses, but a function extension is used in a
 ///   way that RFC 9535 §2.4 forbids ([`Error::UnknownFunction`],
 ///   [`Error::FunctionArity`], [`Error::IllTyped`]).
@@ -59,6 +73,20 @@ pub enum Error {
     IntegerOutOfRange {
         /// The offending integer literal, verbatim from the query.
         repr: String,
+    },
+
+    /// The query nests brackets or parentheses deeper than the supported limit
+    /// (currently 128 levels).
+    ///
+    /// Parsing recurses once per nested filter, parenthesized expression, or
+    /// function call, so nesting is capped to keep a hostile query from exhausting
+    /// the stack (an abort, not a catchable panic). Only *nesting* is limited —
+    /// sequential segments (`$[0][1]…`) are parsed iteratively, and a query of any
+    /// length is accepted as long as it does not nest this deep. The deepest
+    /// compliance-suite case nests 4 levels.
+    NestingTooDeep {
+        /// Byte offset of the bracket or parenthesis that exceeded the limit.
+        position: usize,
     },
 
     /// A filter calls a function extension whose name is not registered.
@@ -100,6 +128,10 @@ impl fmt::Display for Error {
             Self::IntegerOutOfRange { repr } => write!(
                 f,
                 "integer {repr} is outside the safe range [{MIN_SAFE_INTEGER}, {MAX_SAFE_INTEGER}]"
+            ),
+            Self::NestingTooDeep { position } => write!(
+                f,
+                "query nesting exceeds the supported depth of {MAX_NESTING_DEPTH} at position {position}"
             ),
             Self::UnknownFunction { name } => write!(f, "unknown function extension `{name}`"),
             Self::FunctionArity {

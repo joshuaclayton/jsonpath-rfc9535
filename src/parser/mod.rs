@@ -28,6 +28,7 @@
 
 use crate::Error;
 use crate::ast::Query;
+use crate::error::MAX_NESTING_DEPTH;
 use nom::bytes::complete::take_while;
 use nom::{Parser, combinator::all_consuming};
 
@@ -100,13 +101,59 @@ impl<'a> nom::error::ParseError<&'a str> for ParserError<'a> {
 /// # Errors
 ///
 /// Returns [`Error::Syntax`] (with the byte offset at which parsing failed) if the
-/// string is not a grammatically valid JSONPath query, or [`Error::IntegerOutOfRange`]
-/// if an array index or slice bound lies outside the I-JSON safe range.
+/// string is not a grammatically valid JSONPath query, [`Error::IntegerOutOfRange`]
+/// if an array index or slice bound lies outside the I-JSON safe range, or
+/// [`Error::NestingTooDeep`] if brackets/parentheses nest beyond
+/// [`MAX_NESTING_DEPTH`].
 pub fn parse(input: &str) -> Result<Query, Error> {
+    check_nesting(input)?;
     match all_consuming(query::query).parse(input) {
         Ok((_rest, query)) => Ok(query),
         Err(err) => Err(map_nom_error(input, err)),
     }
+}
+
+/// Rejects input nested deeper than [`MAX_NESTING_DEPTH`] before any recursive
+/// grammar rule runs. The parser recurses once per nested filter, parenthesized
+/// expression, and function call, so without this gate a ~10 kB hostile query
+/// overflows the stack — a process abort, not a catchable panic (measured: aborts
+/// near 1 000 levels in debug builds, under 10 000 in release).
+///
+/// Depth is the maximum number of *simultaneously open* `(`/`[` outside string
+/// literals: every construct the grammar recurses into opens one of those two
+/// characters, and sequential segments close each bracket before the next opens,
+/// so flat queries of any length never accumulate depth. String literals are
+/// skipped under the grammar's quote/escape rules — a bracket inside `$['((((']`
+/// is content, not structure. Unbalanced input needs no special care: unmatched
+/// opens are exactly the attack shape (still counted), and unmatched closes
+/// saturate at zero (the parser rejects them later on its own).
+fn check_nesting(input: &str) -> Result<(), Error> {
+    let mut depth = 0_usize;
+    let mut quote: Option<char> = None;
+    let mut chars = input.char_indices();
+    while let Some((position, c)) = chars.next() {
+        match quote {
+            Some(active) => {
+                if c == '\\' {
+                    chars.next();
+                } else if c == active {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' | '[' => {
+                    depth += 1;
+                    if depth > MAX_NESTING_DEPTH {
+                        return Err(Error::NestingTooDeep { position });
+                    }
+                }
+                ')' | ']' => depth = depth.saturating_sub(1),
+                _ => {}
+            },
+        }
+    }
+    Ok(())
 }
 
 /// Converts a nom error into a crate [`Error`]: a typed cause carried by the
@@ -136,6 +183,76 @@ pub fn s(input: &str) -> ParseResult<'_, &str> {
 mod tests {
     use super::parse;
     use crate::Error;
+    use crate::error::MAX_NESTING_DEPTH;
+
+    #[test]
+    fn hostile_nesting_is_rejected_not_a_stack_overflow() {
+        // Regression: before the depth gate, both shapes overflowed the stack (a
+        // process abort) at a few thousand levels — roughly 10 kB of input.
+        let parens = format!("$[?{}", "(".repeat(100_000));
+        assert!(
+            matches!(parse(&parens), Err(Error::NestingTooDeep { .. })),
+            "unclosed nested parens are rejected by the depth gate"
+        );
+        let filters = format!("${}", "[?@".repeat(100_000));
+        assert!(
+            matches!(parse(&filters), Err(Error::NestingTooDeep { .. })),
+            "nested filter brackets are rejected by the depth gate"
+        );
+    }
+
+    #[test]
+    fn nesting_at_the_limit_still_parses() {
+        // Exactly MAX_NESTING_DEPTH simultaneous opens: the filter `[` plus the
+        // parens. Doubles as proof the limit is safely parseable on a test thread.
+        let depth = MAX_NESTING_DEPTH - 1;
+        let query = format!("$[?{}@.a{}]", "(".repeat(depth), ")".repeat(depth));
+        assert!(
+            parse(&query).is_ok(),
+            "a query at the depth limit is accepted"
+        );
+
+        // One level past the limit is grammatically valid — only the gate rejects it.
+        let query = format!(
+            "$[?{}@.a{}]",
+            "(".repeat(MAX_NESTING_DEPTH),
+            ")".repeat(MAX_NESTING_DEPTH)
+        );
+        assert!(
+            matches!(parse(&query), Err(Error::NestingTooDeep { .. })),
+            "one level past the limit is rejected by the gate, not the grammar"
+        );
+    }
+
+    #[test]
+    fn flat_query_length_is_not_limited() {
+        // Sequential brackets close before the next opens — depth never exceeds 1,
+        // so query *length* is unconstrained by the gate.
+        let indexes = format!("${}", "[0]".repeat(10_000));
+        assert!(
+            parse(&indexes).is_ok(),
+            "10k sequential index segments accumulate no nesting depth"
+        );
+        let names = format!("${}", ".a".repeat(10_000));
+        assert!(
+            parse(&names).is_ok(),
+            "10k shorthand name segments accumulate no nesting depth"
+        );
+    }
+
+    #[test]
+    fn brackets_inside_string_literals_do_not_count_as_nesting() {
+        let name = format!("$['{}']", "(".repeat(1_000));
+        assert!(
+            parse(&name).is_ok(),
+            "parens inside a quoted member name are content, not nesting"
+        );
+        let literal = format!("$[?@.a == '{}']", "[".repeat(1_000));
+        assert!(
+            parse(&literal).is_ok(),
+            "brackets inside a filter string literal are content, not nesting"
+        );
+    }
 
     #[test]
     fn out_of_range_index_reports_the_typed_variant() {

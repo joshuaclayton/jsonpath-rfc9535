@@ -14,6 +14,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Out-of-range array indexes and slice bounds are rejected with
   `Error::IntegerOutOfRange`, carrying the offending integer text verbatim, rather
   than a generic syntax error.
+- Queries nesting brackets or parentheses deeper than 128 levels are rejected with
+  `Error::NestingTooDeep`. Previously a hostile query of ~10 kB could exhaust the
+  parser's stack and abort the process; only nesting is limited — flat queries of
+  any length still parse.
 - Conformance verified against the JSONPath Compliance Test Suite.
 - A `jp` command-line tool (installed via `cargo install jsonpath-rfc9535`) that queries JSON from a file or stdin.
 - An experimental `scan` feature: `ScanQuery` evaluates queries over raw JSON text by
