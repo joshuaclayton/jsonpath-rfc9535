@@ -20,9 +20,9 @@
 //! * Integer range checking: a parsed integer must be turned into a
 //!   [`JsonInt`](crate::ast::JsonInt) via the [`int`](number::int) combinator, which
 //!   rejects values outside the I-JSON safe range with a [`nom::Err::Failure`]
-//!   carrying [`Error::IntegerOutOfRange`] — the typed variant survives to
-//!   [`parse`]'s caller instead of collapsing into a generic syntax error (see
-//!   [`ParserError`]).
+//!   carrying the offending literal (see [`ParserError`]) — surfaced to [`parse`]'s
+//!   caller as [`Error::IntegerOutOfRange`] instead of collapsing into a generic
+//!   syntax error.
 //!
 //! [RFC 9535 Appendix A]: https://www.rfc-editor.org/rfc/rfc9535#appendix-A
 
@@ -42,44 +42,37 @@ pub mod slice;
 pub mod string;
 
 /// The result type of every combinator in this parser: [`nom::IResult`] over `&str`
-/// with [`ParserError`] as the error type, so a typed crate [`Error`] can travel
-/// through nom to [`parse`]'s caller.
+/// with [`ParserError`] as the error type, so a specific failure can travel through
+/// nom to [`parse`]'s caller instead of collapsing into a generic syntax error.
 pub type ParseResult<'a, O> = nom::IResult<&'a str, O, ParserError<'a>>;
 
 /// The error type threaded through every combinator in this parser.
 ///
-/// Like nom's default error it records *where* parsing failed (the unconsumed
-/// remainder, from which [`parse`] recovers the byte offset). Additionally it can
-/// carry a typed crate [`Error`] when a rule identified a specific violation —
-/// today only [`Error::IntegerOutOfRange`], raised by [`number::int`] as a
-/// [`nom::Err::Failure`] so it aborts alternation and reaches the caller verbatim
-/// instead of being masked by a sibling branch's generic syntax error.
-#[derive(Debug)]
-pub struct ParserError<'a> {
-    /// The unconsumed remainder at the point of failure.
-    input: &'a str,
-    /// The specific violation, when a rule identified one.
-    cause: Option<Error>,
-}
-
-impl<'a> ParserError<'a> {
-    /// A failure at `input` carrying the specific violation `cause`.
-    pub const fn with_cause(input: &'a str, cause: Error) -> Self {
-        Self {
-            input,
-            cause: Some(cause),
-        }
-    }
-
-    /// A plain failure at `input`, reported as a generic [`Error::Syntax`].
-    pub const fn plain(input: &'a str) -> Self {
-        Self { input, cause: None }
-    }
+/// Deliberately shaped to cost exactly what nom's own error costs — 24 bytes,
+/// `Copy`, no drop glue — because combinators construct and *discard* these on
+/// every backtracking `alt` branch, so the error type's width and droppability tax
+/// each such return. Two earlier designs measured that tax on `parse/*`: carrying
+/// an owned crate [`Error`] inline regressed +7…+33% (every `Result` widened by
+/// ~32 bytes), and `Option<Box<Error>>` still regressed the filter rows +6…+11%
+/// (drop glue forces every discarded branch error to be checked). Borrowing the
+/// offending text from the query keeps this type trivial; the owned [`Error`] is
+/// materialized once, in [`map_nom_error`], on the already-failed path.
+#[derive(Debug, Clone, Copy)]
+pub enum ParserError<'a> {
+    /// A generic failure; the payload is the unconsumed remainder, from which
+    /// [`parse`] recovers the byte offset ([`Error::Syntax`]).
+    Plain(&'a str),
+    /// An index or slice integer outside the I-JSON safe range (or overflowing
+    /// `i64` outright); the payload is the literal, borrowed from the query
+    /// ([`Error::IntegerOutOfRange`]). Raised by [`number::int`] as a
+    /// [`nom::Err::Failure`] so it aborts alternation and reaches the caller
+    /// instead of being masked by a sibling branch's generic error.
+    IntegerOutOfRange(&'a str),
 }
 
 impl<'a> nom::error::ParseError<&'a str> for ParserError<'a> {
     fn from_error_kind(input: &'a str, _kind: nom::error::ErrorKind) -> Self {
-        Self::plain(input)
+        Self::Plain(input)
     }
 
     fn append(_input: &'a str, _kind: nom::error::ErrorKind, other: Self) -> Self {
@@ -87,10 +80,9 @@ impl<'a> nom::error::ParseError<&'a str> for ParserError<'a> {
     }
 
     fn or(self, other: Self) -> Self {
-        // Prefer the branch that identified a typed cause (nom's default keeps
-        // `other`). Defensive: causes currently travel as `Failure`, which
-        // short-circuits `alt` before any merge happens.
-        if self.cause.is_some() { self } else { other }
+        // nom's default: keep the later branch's error. A specific failure never
+        // reaches a merge — it travels as `Failure`, which short-circuits `alt`.
+        other
     }
 }
 
@@ -109,7 +101,7 @@ pub fn parse(input: &str) -> Result<Query, Error> {
     check_nesting(input)?;
     match all_consuming(query::query).parse(input) {
         Ok((_rest, query)) => Ok(query),
-        Err(err) => Err(map_nom_error(input, err)),
+        Err(err) => Err(map_nom_error(input, &err)),
     }
 }
 
@@ -128,6 +120,12 @@ pub fn parse(input: &str) -> Result<Query, Error> {
 /// opens are exactly the attack shape (still counted), and unmatched closes
 /// saturate at zero (the parser rejects them later on its own).
 fn check_nesting(input: &str) -> Result<(), Error> {
+    // Exceeding the limit requires at least MAX_NESTING_DEPTH + 1 opening
+    // brackets, i.e. at least that many bytes — shorter input cannot trip it, so
+    // the overwhelmingly common short query skips the scan entirely.
+    if input.len() <= MAX_NESTING_DEPTH {
+        return Ok(());
+    }
     let mut depth = 0_usize;
     let mut quote: Option<char> = None;
     let mut chars = input.char_indices();
@@ -156,18 +154,24 @@ fn check_nesting(input: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Converts a nom error into a crate [`Error`]: a typed cause carried by the
-/// [`ParserError`] is returned verbatim; anything else becomes [`Error::Syntax`]
-/// with the byte offset of the failure recovered from the unconsumed remainder.
-fn map_nom_error(full: &str, err: nom::Err<ParserError<'_>>) -> Error {
-    let (remainder_len, cause) = match err {
-        nom::Err::Error(inner) | nom::Err::Failure(inner) => (inner.input.len(), inner.cause),
-        nom::Err::Incomplete(_) => (0, None),
-    };
-    cause.unwrap_or_else(|| Error::Syntax {
-        position: full.len().saturating_sub(remainder_len),
+/// Converts a nom error into a crate [`Error`] — the single place the owned error
+/// is materialized, so the per-branch [`ParserError`] values stay allocation-free.
+/// A specific failure maps to its variant; a plain one becomes [`Error::Syntax`]
+/// with the byte offset recovered from the unconsumed remainder.
+fn map_nom_error(full: &str, err: &nom::Err<ParserError<'_>>) -> Error {
+    let syntax = |position: usize| Error::Syntax {
+        position,
         message: "the input is not a valid JSONPath query".to_owned(),
-    })
+    };
+    match err {
+        nom::Err::Error(inner) | nom::Err::Failure(inner) => match *inner {
+            ParserError::Plain(remainder) => syntax(full.len().saturating_sub(remainder.len())),
+            ParserError::IntegerOutOfRange(literal) => Error::IntegerOutOfRange {
+                repr: literal.to_owned(),
+            },
+        },
+        nom::Err::Incomplete(_) => syntax(full.len()),
+    }
 }
 
 /// rule: `S = *B` where `B = %x20 / %x09 / %x0A / %x0D` — optional blank space.

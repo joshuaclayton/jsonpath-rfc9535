@@ -21,11 +21,12 @@
 //!   leading-zero query `$[01]` is rejected because the surrounding bracket is parsed
 //!   with `all_consuming`, not because `int` errors.
 //! * A valid integer that overflows `i64`, or one within `i64` but outside the
-//!   I-JSON safe range, both fail with [`Error::IntegerOutOfRange`], raised as a
-//!   [`nom::Err::Failure`] carrying the typed variant (see [`ParserError`]). A
-//!   `Failure` aborts alternation on purpose: once integer text has been consumed in
-//!   an index or slice position, the grammar admits no other reading of it, so the
-//!   specific error must not be masked by a sibling branch's generic one.
+//!   I-JSON safe range, both fail with a [`nom::Err::Failure`] carrying the
+//!   offending literal (see [`ParserError`]), surfaced to the caller as
+//!   [`Error::IntegerOutOfRange`](crate::Error). A `Failure` aborts alternation on
+//!   purpose: once integer text has been consumed in an index or slice position,
+//!   the grammar admits no other reading of it, so the specific error must not be
+//!   masked by a sibling branch's generic one.
 //! * `number` (filter literals) is *not* range-restricted; the recognized text is
 //!   handed to `serde_json` to build the [`Number`]. Per ABNF case-insensitivity the
 //!   exponent marker may be `e` or `E`.
@@ -38,7 +39,6 @@
 
 use super::{ParseResult, ParserError};
 use crate::ast::JsonInt;
-use crate::error::Error;
 use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
@@ -59,7 +59,7 @@ where
         let (rest, _) = parser.parse(input)?;
         let consumed = input.len().saturating_sub(rest.len());
         input.get(..consumed).map_or_else(
-            || Err(nom::Err::Error(ParserError::plain(input))),
+            || Err(nom::Err::Error(ParserError::Plain(input))),
             |matched| Ok((rest, matched)),
         )
     }
@@ -79,24 +79,20 @@ fn int_text(input: &str) -> ParseResult<'_, &str> {
 /// rule: `int` — a decimal integer, range-checked into a [`JsonInt`].
 ///
 /// An integer that parses but lies outside the I-JSON safe range — or overflows
-/// `i64` outright — raises a [`nom::Err::Failure`] carrying
-/// [`Error::IntegerOutOfRange`]: in every position the grammar admits `int`, an
-/// out-of-range value has no alternative reading, so the failure is terminal and
-/// the typed variant survives to the caller (see the module docs).
+/// `i64` outright, which is a fortiori out of range — raises a
+/// [`nom::Err::Failure`] carrying the offending literal (surfaced to the caller as
+/// [`Error::IntegerOutOfRange`](crate::Error)): in every position the grammar
+/// admits `int`, an out-of-range value has no alternative reading, so the failure
+/// is terminal and the specific error survives to the caller (see the module docs).
 pub fn int(input: &str) -> ParseResult<'_, JsonInt> {
     let (rest, text) = int_text(input)?;
-    let cause = match text.parse::<i64>() {
-        Ok(value) => match JsonInt::new(value) {
-            Ok(int) => return Ok((rest, int)),
-            Err(error) => error,
-        },
-        // Overflowing `i64` is a fortiori outside the safe range; the variant keeps
-        // the text form precisely because such values have no `i64` representation.
-        Err(_overflow) => Error::IntegerOutOfRange {
-            repr: text.to_owned(),
-        },
-    };
-    Err(nom::Err::Failure(ParserError::with_cause(input, cause)))
+    text.parse::<i64>()
+        .ok()
+        .and_then(|value| JsonInt::new(value).ok())
+        .map_or_else(
+            || Err(nom::Err::Failure(ParserError::IntegerOutOfRange(text))),
+            |int| Ok((rest, int)),
+        )
 }
 
 /// rule: `frac = "." 1*DIGIT`.
@@ -120,7 +116,7 @@ pub fn number(input: &str) -> ParseResult<'_, Number> {
 
 #[cfg(test)]
 mod tests {
-    use super::{int, number};
+    use super::{ParserError, int, number};
     use crate::ast::JsonInt;
     use crate::error::{MAX_SAFE_INTEGER, MIN_SAFE_INTEGER};
 
@@ -207,14 +203,12 @@ mod tests {
         let result = int("9007199254740992");
         assert!(
             matches!(
-                &result,
-                Err(nom::Err::Failure(error))
-                    if error.cause
-                        == Some(crate::Error::IntegerOutOfRange {
-                            repr: "9007199254740992".to_owned(),
-                        })
+                result,
+                Err(nom::Err::Failure(ParserError::IntegerOutOfRange(
+                    "9007199254740992"
+                )))
             ),
-            "expected Failure carrying IntegerOutOfRange, got {result:?}"
+            "expected Failure carrying the offending literal, got {result:?}"
         );
     }
 
