@@ -84,6 +84,23 @@ bench-backends-rayon: bench-fixtures
   cargo run --release --manifest-path benches/backend-harness/Cargo.toml --features rayon
   cargo run --release --manifest-path benches/backend-harness/Cargo.toml --features preserve_order,rayon
 
+# Compiled-query evaluation per engine, per example selector, per fixture size —
+# selectors and crate names only, no internal bench labels. Runs the harness twice
+# because the rayon feature is compile-time: the parallel column comes from a
+# `--features rayon` build, everything else from the default (serial) build.
+# Everything except the markdown goes to stderr, so `just bench-readme > bench.md`
+# captures a clean document.
+# Generate the README benchmark tables (markdown on stdout, ~4 min)
+[group('bench')]
+bench-readme:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  python3 benches/data/generate.py >&2
+  rayon_data=$(mktemp)
+  trap 'rm -f "$rayon_data"' EXIT
+  cargo run --release --quiet --manifest-path benches/readme-tables/Cargo.toml --features rayon -- --rayon-only > "$rayon_data"
+  cargo run --release --quiet --manifest-path benches/readme-tables/Cargo.toml -- --rayon "$rayon_data"
+
 # Save the current numbers as the `main` baseline for future comparisons.
 [group('bench')]
 bench-save-baseline: bench-fixtures
@@ -203,13 +220,15 @@ test-msrv:
 test-lint-compare:
   cargo clippy --workspace --all-targets --features compare -- -D warnings
 
-# Both are standalone crates outside the workspace, so no other gate compiles them
+# All are standalone crates outside the workspace, so no other gate compiles them
 # and a lib API change could silently break them.
-# Compile-check the satellite crates (fuzz harness, backend bench harness)
+# Compile-check the satellite crates (fuzz, backend-harness, readme-tables)
 [group('test')]
 test-satellites:
   cargo check --manifest-path fuzz/Cargo.toml
   cargo check --manifest-path benches/backend-harness/Cargo.toml
+  cargo check --manifest-path benches/readme-tables/Cargo.toml
+  cargo check --manifest-path benches/readme-tables/Cargo.toml --features rayon
 
 # Self-enforcing in both directions: this recipe is itself a ci dependency and a
 # matrix row, so a recipe added to one list but not the other fails the gate both

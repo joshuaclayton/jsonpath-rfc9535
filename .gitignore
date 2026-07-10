@@ -8,3 +8,4 @@
 # regenerate rather than commit them.
 /benches/data/*.json
 /benches/backend-harness/target
+/benches/readme-tables/target
