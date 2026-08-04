@@ -5,17 +5,24 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-04
+
+### Added
+
+- `NormalizedPath::elements()` — the path's steps as structural `Element::Name` /
+  `Element::Index` data, root → leaf, for callers that walk a document along the
+  path (e.g. to reach a node's parent container for removal) instead of parsing
+  the `Display` form. Member names are verbatim; §2.7 escaping stays a
+  rendering-only concern.
+
+## [0.1.0] - 2026-07-10
+
 ### Added
 
 - RFC 9535 JSONPath queries over `serde_json::Value`: name, wildcard, index, slice, and
   filter selectors; child and descendant segments; and the `length`, `count`, `value`,
   `match`, and `search` functions (`match`/`search` behind the default `regex` feature).
 - Normalized paths (RFC 9535 §2.7) for each selected node.
-- `NormalizedPath::elements()` — the path's steps as structural `Element::Name` /
-  `Element::Index` data, root → leaf, for callers that walk a document along the
-  path (e.g. to reach a node's parent container for removal) instead of parsing
-  the `Display` form. Member names are verbatim; §2.7 escaping stays a
-  rendering-only concern.
 - Out-of-range array indexes and slice bounds are rejected with
   `Error::IntegerOutOfRange`, carrying the offending integer text verbatim, rather
   than a generic syntax error.
