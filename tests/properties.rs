@@ -1,7 +1,7 @@
 //! Property-based tests (proptest) for invariants that must hold across *all* inputs,
 //! complementing the example-driven compliance harness in `compliance_test_suite.rs`.
 //!
-//! Three properties:
+//! Four properties:
 //! * **parse never panics** — `JsonPath::parse` returns `Ok`/`Err` for any input,
 //!   including adversarial token soup, but never panics.
 //! * **normalized paths round-trip** — every path the engine emits re-parses as a
@@ -9,8 +9,11 @@
 //!   canonical, so normalization is idempotent).
 //! * **a normalized path re-selects its own node** — re-querying the document with a
 //!   node's path yields exactly that node, with the same value.
+//! * **a path's elements walk back to its node** — following `elements()` step by
+//!   step through the document lands on the same value, so the structural form is
+//!   as faithful as the string form.
 
-use jsonpath_rfc9535::JsonPath;
+use jsonpath_rfc9535::{Element, JsonPath};
 use proptest::prelude::*;
 use serde_json::Value;
 
@@ -159,6 +162,38 @@ proptest! {
                     rendered
                 );
             }
+        }
+    }
+
+    /// Following a node's `elements()` through the document — `get(name)` /
+    /// `get(index)` per step — lands on exactly the node the path identifies.
+    /// This is the contract structural consumers (e.g. locating a parent
+    /// container for removal) depend on.
+    #[test]
+    fn elements_walk_reselects_its_node(document in arb_json()) {
+        let Ok(all) = JsonPath::parse("$..*") else {
+            return Err(TestCaseError::fail("the fixed $..* query always parses"));
+        };
+        for node in &all.query(&document) {
+            let mut current = &document;
+            for element in node.path().elements() {
+                let stepped = match element {
+                    Element::Name(name) => current.get(name),
+                    Element::Index(index) => current.get(index),
+                };
+                let Some(next) = stepped else {
+                    return Err(TestCaseError::fail(format!(
+                        "a step of `{}` selects nothing in the document", node.path()
+                    )));
+                };
+                current = next;
+            }
+            prop_assert_eq!(
+                current,
+                node.value(),
+                "walking the elements of `{}` reached a different node",
+                node.path()
+            );
         }
     }
 }

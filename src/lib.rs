@@ -126,7 +126,7 @@ mod scan;
 pub use error::Error;
 pub use jsonpath::JsonPath;
 pub use node::{LocatedNode, NodeList};
-pub use normalized_path::NormalizedPath;
+pub use normalized_path::{Element, NormalizedPath};
 #[cfg(feature = "scan")]
 #[cfg_attr(docsrs, doc(cfg(feature = "scan")))]
 pub use scan::{ScanError, ScanMode, ScanQuery};
