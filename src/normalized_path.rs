@@ -187,6 +187,102 @@ fn write_escaped_name(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
 #[cfg(test)]
 mod tests {
     use super::{Element, NormalizedPath};
+    use crate::JsonPath;
+    use serde_json::json;
+
+    /// Runs `path` against `doc` and returns each selected node's elements.
+    fn queried_elements<'a>(doc: &'a serde_json::Value, path: &str) -> Vec<Vec<Element<'a>>> {
+        JsonPath::parse(path)
+            .expect("query parses")
+            .query(doc)
+            .paths()
+            .map(NormalizedPath::elements)
+            .collect()
+    }
+
+    #[test]
+    fn negative_index_normalizes_to_positive_position() {
+        // RFC 9535 §2.7: normalized paths use only non-negative indexes —
+        // `$[-1]` selects from the end, but the node's IDENTITY is its
+        // actual array position.
+        let doc = json!(["a", "b", "c"]);
+        assert_eq!(
+            queried_elements(&doc, "$[-1]"),
+            vec![vec![Element::Index(2)]],
+            "-1 on a 3-element array normalizes to index 2"
+        );
+        assert_eq!(
+            queried_elements(&doc, "$[-3]"),
+            vec![vec![Element::Index(0)]],
+            "-len reaches the first element exactly"
+        );
+    }
+
+    #[test]
+    fn out_of_range_negative_index_selects_nothing() {
+        let doc = json!(["a", "b", "c"]);
+        assert_eq!(
+            queried_elements(&doc, "$[-4]"),
+            Vec::<Vec<Element<'_>>>::new(),
+            "past the front there is no node, so no path either"
+        );
+    }
+
+    #[test]
+    fn reverse_slice_paths_carry_actual_positions_in_visit_order() {
+        // A negative-step slice visits elements back to front; each path
+        // still identifies the node by its real (non-negative) position.
+        let doc = json!(["a", "b", "c"]);
+        assert_eq!(
+            queried_elements(&doc, "$[::-1]"),
+            vec![
+                vec![Element::Index(2)],
+                vec![Element::Index(1)],
+                vec![Element::Index(0)],
+            ],
+            "visit order is reversed, positions are absolute"
+        );
+    }
+
+    #[test]
+    fn descendant_segment_paths_carry_the_full_location() {
+        let doc = json!({"a": {"parts": [{"x": 1}]}, "x": 2});
+        let mut got = queried_elements(&doc, "$..x");
+        got.sort_by_key(Vec::len);
+        assert_eq!(
+            got,
+            vec![
+                vec![Element::Name("x")],
+                vec![
+                    Element::Name("a"),
+                    Element::Name("parts"),
+                    Element::Index(0),
+                    Element::Name("x"),
+                ],
+            ],
+            "every match locates itself from the root, however deep"
+        );
+    }
+
+    #[test]
+    fn queried_names_are_borrowed_verbatim_not_escaped() {
+        // The member name flows from the document's own key into the
+        // element untouched — quoting/escaping exists only in Display.
+        let doc = json!({"it's \\ here": true});
+        let query = JsonPath::parse("$['it\\'s \\\\ here']").expect("query parses");
+        let nodes = query.query(&doc);
+        let node = nodes.exactly_one().expect("one match");
+        assert_eq!(
+            node.path().elements(),
+            vec![Element::Name("it's \\ here")],
+            "structural form is the raw key"
+        );
+        assert_eq!(
+            node.path().to_string(),
+            r"$['it\'s \\ here']",
+            "rendered form escapes per §2.7"
+        );
+    }
 
     #[test]
     fn elements_run_root_to_leaf() {
