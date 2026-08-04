@@ -32,6 +32,27 @@ struct Link<'a> {
     parent: Option<Rc<Self>>,
 }
 
+/// One element of a [`NormalizedPath`], as structural data: an object member name
+/// or an array index.
+///
+/// This is the machine-readable counterpart to the path's
+/// [`Display`](fmt::Display) form — member names are returned verbatim (the §2.7
+/// quoting and escaping in `$['a\'b'][3]` is a rendering concern only), borrowed
+/// from the queried document's map keys like the path itself.
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "RFC 9535 §2.7 defines a normalized path as exactly member names and \
+              array indexes; a hypothetical new element kind must break every \
+              consumer that walks documents by these steps"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Element<'a> {
+    /// An object member name, verbatim (unescaped).
+    Name(&'a str),
+    /// An array element index.
+    Index(usize),
+}
+
 /// The canonical, unique location of a node within a JSON document.
 ///
 /// You obtain a `NormalizedPath` from a query result — [`LocatedNode::path`] or
@@ -77,6 +98,46 @@ impl<'a> NormalizedPath<'a> {
             })),
         }
     }
+
+    /// Returns the path's elements as structural data, root → leaf. The root path
+    /// `$` has no elements.
+    ///
+    /// Use this to walk a document along the path instead of parsing the
+    /// [`Display`](fmt::Display) form — e.g. to reach a node's **parent container**
+    /// (for removal or replacement), split off the last element:
+    ///
+    /// ```
+    /// use jsonpath_rfc9535::{Element, JsonPath};
+    ///
+    /// let doc = serde_json::json!({"parts": [{"body": "a"}, {"body": "b"}]});
+    /// let query = JsonPath::parse("$.parts[1].body")?;
+    /// let nodes = query.query(&doc);
+    /// let node = nodes.exactly_one().expect("one match");
+    ///
+    /// let elements = node.path().elements();
+    /// assert_eq!(
+    ///     elements,
+    ///     [Element::Name("parts"), Element::Index(1), Element::Name("body")],
+    /// );
+    /// let (leaf, parents) = elements.split_last().expect("non-root path");
+    /// assert_eq!(*leaf, Element::Name("body"));
+    /// assert_eq!(parents, [Element::Name("parts"), Element::Index(1)]);
+    /// # Ok::<(), jsonpath_rfc9535::Error>(())
+    /// ```
+    #[must_use]
+    pub fn elements(&self) -> Vec<Element<'a>> {
+        // The chain is stored leaf → root; collect and reverse to present the
+        // order a document walk needs.
+        let mut elements: Vec<Element<'a>> =
+            core::iter::successors(self.head.as_deref(), |link| link.parent.as_deref())
+                .map(|link| match link.step {
+                    Step::Name(name) => Element::Name(name),
+                    Step::Index(index) => Element::Index(index),
+                })
+                .collect();
+        elements.reverse();
+        elements
+    }
 }
 
 impl Default for NormalizedPath<'_> {
@@ -88,19 +149,14 @@ impl Default for NormalizedPath<'_> {
 impl fmt::Display for NormalizedPath<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("$")?;
-        // The chain is stored leaf → root; collect it so we can render root → leaf.
-        let steps: Vec<&Step<'_>> =
-            core::iter::successors(self.head.as_deref(), |link| link.parent.as_deref())
-                .map(|link| &link.step)
-                .collect();
-        for step in steps.iter().rev() {
-            match step {
-                Step::Name(name) => {
+        for element in self.elements() {
+            match element {
+                Element::Name(name) => {
                     f.write_str("['")?;
                     write_escaped_name(f, name)?;
                     f.write_str("']")?;
                 }
-                Step::Index(index) => write!(f, "[{index}]")?,
+                Element::Index(index) => write!(f, "[{index}]")?,
             }
         }
         Ok(())
@@ -130,7 +186,53 @@ fn write_escaped_name(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::NormalizedPath;
+    use super::{Element, NormalizedPath};
+
+    #[test]
+    fn elements_run_root_to_leaf() {
+        let path = NormalizedPath::root()
+            .child_name("a")
+            .child_index(3)
+            .child_name("b");
+        assert_eq!(
+            path.elements(),
+            vec![Element::Name("a"), Element::Index(3), Element::Name("b")],
+            "elements are structural data in root → leaf order"
+        );
+    }
+
+    #[test]
+    fn root_has_no_elements() {
+        assert_eq!(
+            NormalizedPath::root().elements(),
+            Vec::new(),
+            "the root path `$` has no elements"
+        );
+    }
+
+    #[test]
+    fn elements_carry_names_verbatim() {
+        // §2.7 escaping is a rendering concern; the structural API returns
+        // the member name exactly as it appears in the document.
+        assert_eq!(
+            NormalizedPath::root().child_name("a'\\b").elements(),
+            vec![Element::Name("a'\\b")],
+            "no escaping in the structural form"
+        );
+    }
+
+    #[test]
+    fn split_last_walks_to_the_parent_container() {
+        let path = NormalizedPath::root().child_name("parts").child_index(2);
+        let elements = path.elements();
+        let (leaf, parents) = elements.split_last().expect("non-root path");
+        assert_eq!(*leaf, Element::Index(2), "leaf identifies the node itself");
+        assert_eq!(
+            parents,
+            &[Element::Name("parts")],
+            "prefix locates the parent container"
+        );
+    }
 
     #[test]
     fn root_is_dollar() {
