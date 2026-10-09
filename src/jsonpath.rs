@@ -1,7 +1,7 @@
 //! The compiled, runnable JSONPath query type.
 
 use crate::compiled::{self, Query};
-use crate::{Error, NodeList};
+use crate::{Error, NodeList, SingularSegment};
 use core::str::FromStr;
 use serde_json::Value;
 
@@ -70,6 +70,30 @@ impl JsonPath {
             || crate::eval::evaluate_values(self.compiled(), root),
             |singular| crate::eval::evaluate_singular_values(singular, root),
         )
+    }
+
+    /// Returns the query's steps when each one selects a single child by member name
+    /// or array index, so the query selects at most one node; `None` when it has a
+    /// wildcard, slice, filter, descendant segment, or more than one selector in a
+    /// segment. Member names are decoded: `$['a\'b']` has the name `a'b`.
+    ///
+    /// ```
+    /// use jsonpath_rfc9535::{JsonPath, SingularSegment};
+    ///
+    /// let path = JsonPath::parse("$.store['book'][-1]")?;
+    /// let steps = path.singular_steps().expect("names and indexes only");
+    /// assert!(matches!(&steps[0], SingularSegment::Name(name) if name == "store"));
+    /// assert!(matches!(&steps[2], SingularSegment::Index(index) if index.get() == -1));
+    ///
+    /// assert!(JsonPath::parse("$.store.*")?.singular_steps().is_none());
+    /// # Ok::<(), jsonpath_rfc9535::Error>(())
+    /// ```
+    #[must_use]
+    pub fn singular_steps(&self) -> Option<&[SingularSegment]> {
+        self.query
+            .singular
+            .as_ref()
+            .map(|singular| singular.segments.as_slice())
     }
 
     /// Returns the compiled query IR (consumed by the evaluator, and by the `scan`

@@ -123,6 +123,7 @@ mod parser;
 #[cfg(feature = "scan")]
 mod scan;
 
+pub use ast::{JsonInt, SingularSegment};
 pub use error::Error;
 pub use jsonpath::JsonPath;
 pub use node::{LocatedNode, NodeList};

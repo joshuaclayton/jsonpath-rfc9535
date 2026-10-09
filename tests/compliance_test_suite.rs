@@ -16,7 +16,7 @@
 //! match. It runs every case and reports a pass/fail summary in the assertion message.
 #![cfg(feature = "regex")]
 
-use jsonpath_rfc9535::JsonPath;
+use jsonpath_rfc9535::{JsonPath, SingularSegment};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -100,6 +100,58 @@ fn compliance() {
             String::new()
         },
     );
+}
+
+#[test]
+fn singular_steps_walk_to_the_selected_node() {
+    let suite: Suite =
+        serde_json::from_str(SUITE).expect("compliance_test_suite.json is valid JSON");
+    let mut walked = 0;
+    let mut failures: Vec<String> = Vec::new();
+    for case in suite.tests.iter().filter(|case| !case.invalid_selector) {
+        let (Ok(path), Some(document)) = (JsonPath::parse(&case.selector), &case.document) else {
+            continue;
+        };
+        let Some(steps) = path.singular_steps() else {
+            continue;
+        };
+        walked += 1;
+        let selected = path.query_values(document);
+        let by_hand: Vec<&Value> = walk(document, steps).into_iter().collect();
+        if selected != by_hand {
+            failures.push(format!(
+                "  [{}] `{}`: query selected {} nodes, walking the steps reached {}",
+                case.name,
+                case.selector,
+                selected.len(),
+                by_hand.len()
+            ));
+        }
+    }
+    assert!(walked > 0, "no compliance case has singular steps");
+    assert!(
+        failures.is_empty(),
+        "{} of {walked} singular cases disagree:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// Follows member-name and array-index steps through `document` without the evaluator.
+fn walk<'a>(document: &'a Value, steps: &[SingularSegment]) -> Option<&'a Value> {
+    steps.iter().try_fold(document, |node, step| match step {
+        SingularSegment::Name(name) => node.as_object()?.get(name),
+        SingularSegment::Index(index) => {
+            let array = node.as_array()?;
+            let offset = usize::try_from(index.get().unsigned_abs()).ok()?;
+            let position = if index.get() < 0 {
+                array.len().checked_sub(offset)?
+            } else {
+                offset
+            };
+            array.get(position)
+        }
+    })
 }
 
 /// Runs a single case, returning `Err(reason)` if it does not conform.
