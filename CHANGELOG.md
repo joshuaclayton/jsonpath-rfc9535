@@ -5,6 +5,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-09
+
 ### Added
 
 - `JsonPath::singular_steps()` — a query's member-name and array-index steps when
