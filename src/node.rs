@@ -76,7 +76,7 @@ impl<'a> NodeList<'a> {
 
     /// Returns the sole selected node, or `None` unless exactly one was selected.
     #[must_use]
-    pub fn exactly_one(&self) -> Option<&LocatedNode<'a>> {
+    pub const fn exactly_one(&self) -> Option<&LocatedNode<'a>> {
         match self.nodes.as_slice() {
             [only] => Some(only),
             _ => None,

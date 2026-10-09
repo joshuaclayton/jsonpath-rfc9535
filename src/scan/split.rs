@@ -249,7 +249,7 @@ pub fn split(query: &Query) -> Plan {
 /// renders to `$[*]` — fragments are every child of the root), and a lone bare
 /// wildcard step (`$[*]` / `$..*`), which does the same or worse. Deeper wildcards
 /// (`$.a[*]`) are data-dependent and stay unmarked.
-fn statically_covers_whole_document(prefix: &[Segment], has_predicate: bool) -> bool {
+const fn statically_covers_whole_document(prefix: &[Segment], has_predicate: bool) -> bool {
     if has_predicate {
         prefix.is_empty()
     } else {
@@ -260,7 +260,7 @@ fn statically_covers_whole_document(prefix: &[Segment], has_predicate: bool) -> 
 /// The filter a cut segment contributes as a per-fragment predicate: present exactly
 /// when the segment is a child segment holding a single filter selector (the prefix
 /// then gains the `[*]` the filter iterates as).
-fn filter_at_cut(segment: Option<&Segment>) -> Option<&LogicalExpr> {
+const fn filter_at_cut(segment: Option<&Segment>) -> Option<&LogicalExpr> {
     match segment {
         Some(Segment::Child(selectors)) => match selectors.as_slice() {
             [Selector::Filter(expr)] => Some(expr),
@@ -430,7 +430,7 @@ fn singular_leaf_path(query: &ast::SingularQuery, paths: &mut Vec<Vec<ScannableN
 
 /// A single-wildcard segment (`[*]` or `..*`) — as the *entire* prefix it selects every
 /// child of the root / every node.
-fn is_bare_wildcard(segment: &Segment) -> bool {
+const fn is_bare_wildcard(segment: &Segment) -> bool {
     let (Segment::Child(selectors) | Segment::Descendant(selectors)) = segment;
     matches!(selectors.as_slice(), [Selector::Wildcard])
 }
