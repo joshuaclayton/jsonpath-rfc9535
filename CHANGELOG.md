@@ -5,6 +5,16 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `JsonPath::singular_steps()` — a query's member-name and array-index steps when
+  it selects at most one node, or `None` when it has a wildcard, slice, filter,
+  descendant segment, or several selectors in one segment. For callers that hand a
+  path to another engine (such as SQLite's `json_extract`) and need to refuse
+  queries that engine cannot evaluate. `SingularSegment` and `JsonInt` are now
+  public. Member names are decoded. `SingularSegment` is exhaustive: RFC 9535
+  §2.3.5.1 defines a singular query's segments as exactly names and indexes.
+
 ### Changed
 
 - `NodeList::exactly_one()` is now a `const fn`.

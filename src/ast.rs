@@ -38,7 +38,7 @@ pub struct JsonInt(i64);
 
 impl JsonInt {
     /// Constructs a `JsonInt`, validating that `value` lies within the I-JSON
-    /// safe-integer range (see [`MIN_SAFE_INTEGER`]/[`MAX_SAFE_INTEGER`]).
+    /// safe-integer range `[-(2^53)+1, (2^53)-1]`.
     ///
     /// # Errors
     ///
@@ -291,11 +291,17 @@ pub struct SingularQuery {
     pub segments: Vec<SingularSegment>,
 }
 
-/// One step of a [`SingularQuery`]: a single name or index.
+/// One step of a query that selects at most one node: a single name or index. See
+/// [`JsonPath::singular_steps`](crate::JsonPath::singular_steps).
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "RFC 9535 §2.3.5.1 defines a singular query's segments as exactly member \
+              names and array indexes; a hypothetical new step kind must break every \
+              consumer that walks documents by these steps"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum SingularSegment {
-    /// A member name step (`['name']` or `.name`).
+    /// A member name step (`['name']` or `.name`), decoded.
     Name(String),
     /// An array index step (`[3]`, `[-1]`).
     Index(JsonInt),
