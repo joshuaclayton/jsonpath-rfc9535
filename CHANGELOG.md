@@ -5,6 +5,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `NodeList::exactly_one()` is now a `const fn`.
+
 ## [0.1.1] - 2026-08-04
 
 ### Added
